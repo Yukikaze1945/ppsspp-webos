@@ -1,0 +1,173 @@
+/* SPDX-License-Identifier: GPL-3.0-only
+ * webOS community adaptation, modified 2026-10-31.
+ * Bridge-derived files retain their upstream provenance; see THIRD_PARTY_NOTICES.md.
+ */
+#include <ctype.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "bridge_config.h"
+#include "shared_util.h"
+
+static uint32_t g_ring_slots = 0; /* 0 == not yet loaded */
+
+static int is_pow2(uint32_t v)
+{
+  return v != 0 && (v & (v - 1u)) == 0;
+}
+
+static uint32_t round_up_pow2(uint32_t v)
+{
+  if (v < 2u)
+    return 1u;
+  v--;
+  v |= v >> 1;
+  v |= v >> 2;
+  v |= v >> 4;
+  v |= v >> 8;
+  v |= v >> 16;
+  return v + 1u;
+}
+
+/* Minimal "key=value" parser. Ignores blank lines and lines starting with
+ * '#'. Only "ring_slots" is currently recognised. */
+static uint32_t read_config_file(void)
+{
+  FILE *f = fopen(BRIDGE_CONFIG_PATH, "r");
+  if (!f)
+  {
+    log_console("bridge_config: %s not found, using private default "
+                "ring_slots=%u",
+                BRIDGE_CONFIG_PATH, BRIDGE_RING_SLOTS_DEFAULT);
+
+    // This app may read the installed Bridge defaults but must not create
+    // or rewrite another application's configuration.
+    return BRIDGE_RING_SLOTS_DEFAULT;
+  }
+
+  uint32_t slots = BRIDGE_RING_SLOTS_DEFAULT;
+  char line[256];
+
+  while (fgets(line, sizeof(line), f))
+  {
+    char *p = line;
+
+    while (isspace((unsigned char)*p))
+      p++;
+
+    if (*p == '#' || *p == '\0' || *p == '\n')
+      continue;
+
+    char key[64] = {0};
+    long val = 0;
+
+    if (sscanf(p, "%63[^=]=%ld", key, &val) != 2)
+      continue;
+
+    size_t klen = strlen(key);
+    while (klen > 0 && isspace((unsigned char)key[klen - 1]))
+      key[--klen] = '\0';
+
+    char *kp = key;
+    while (isspace((unsigned char)*kp))
+      kp++;
+
+    if (strcmp(kp, "ring_slots") != 0)
+      continue;
+
+    if (val <= 0)
+    {
+      log_error("bridge_config: ring_slots=%ld in %s is invalid, using "
+                "default %u",
+                val, BRIDGE_CONFIG_PATH, BRIDGE_RING_SLOTS_DEFAULT);
+      slots = BRIDGE_RING_SLOTS_DEFAULT;
+    }
+    else
+    {
+      slots = (uint32_t)val;
+    }
+    break;
+  }
+
+  fclose(f);
+
+  return slots;
+}
+
+static uint32_t load_ring_slots(void)
+{
+  const char *env_slots = getenv("PPSSPP_BRIDGE_RING_SLOTS");
+  if (env_slots)
+  {
+    uint32_t slots = 0;
+    int valid = *env_slots != '\0';
+    for (const char *p = env_slots; valid && *p; ++p)
+    {
+      if (*p < '0' || *p > '9')
+      {
+        valid = 0;
+        break;
+      }
+      uint32_t digit = (uint32_t)(*p - '0');
+      if (slots > (UINT32_MAX - digit) / 10u)
+      {
+        valid = 0;
+        break;
+      }
+      slots = slots * 10u + digit;
+    }
+
+    if (valid && slots >= BRIDGE_RING_SLOTS_MIN &&
+        slots <= BRIDGE_RING_SLOTS_MAX && is_pow2(slots))
+    {
+      log_always("bridge_config: BRIDGE_RING_SLOTS=%u (from PPSSPP_BRIDGE_RING_SLOTS)",
+                 slots);
+      return slots;
+    }
+
+    log_error("bridge_config: PPSSPP_BRIDGE_RING_SLOTS='%s' is invalid; "
+              "using default %u without reading or writing %s",
+              env_slots, BRIDGE_RING_SLOTS_DEFAULT, BRIDGE_CONFIG_PATH);
+    return BRIDGE_RING_SLOTS_DEFAULT;
+  }
+
+  uint32_t slots = read_config_file();
+
+  if (slots < BRIDGE_RING_SLOTS_MIN || slots > BRIDGE_RING_SLOTS_MAX)
+  {
+    log_error("bridge_config: ring_slots=%u outside allowed range [%u,%u], "
+              "clamping",
+              slots, BRIDGE_RING_SLOTS_MIN, BRIDGE_RING_SLOTS_MAX);
+    slots = slots < BRIDGE_RING_SLOTS_MIN ? BRIDGE_RING_SLOTS_MIN
+                                          : BRIDGE_RING_SLOTS_MAX;
+  }
+
+  if (!is_pow2(slots))
+  {
+    uint32_t rounded = round_up_pow2(slots);
+    log_error("bridge_config: ring_slots=%u is not a power of two "
+              "(required for `seq & mask` ring indexing), rounding up to %u",
+              slots, rounded);
+    slots = rounded;
+  }
+
+  log_always("bridge_config: BRIDGE_RING_SLOTS=%u (from %s)", slots,
+             BRIDGE_CONFIG_PATH);
+
+  return slots;
+}
+
+uint32_t bridge_config_ring_slots(void)
+{
+  if (!g_ring_slots)
+    g_ring_slots = load_ring_slots();
+
+  return g_ring_slots;
+}
+
+uint32_t bridge_config_ring_mask(void)
+{
+  return bridge_config_ring_slots() - 1u;
+}

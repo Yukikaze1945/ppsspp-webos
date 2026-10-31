@@ -1,0 +1,14 @@
+/source/
+/reference/
+/deps/
+/build/
+/stage/
+/sysroot/
+/toolchain/*sdk-buildroot/
+/toolchain/*.tar.gz
+/toolchain/*.ipk
+__pycache__/
+*.pyc
+*.o
+*.aarch64
+.env

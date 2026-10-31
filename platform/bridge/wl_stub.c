@@ -1,0 +1,2730 @@
+/* SPDX-License-Identifier: GPL-3.0-only
+ * webOS community adaptation, modified 2026-10-31.
+ * Bridge-derived files retain their upstream provenance; see THIRD_PARTY_NOTICES.md.
+ */
+/* Candidate based on bridge-v008 commit f44d3cdca74e72f7ebe473707e816bff585495df. */
+/*
+ * wl_stub.c — Wayland bridge stub for aarch64.
+ *
+ * Compiled as libwayland-client.so.0.  All wl_* calls from the client are
+ * intercepted here; bridge calls are forwarded to the 32-bit proxy via the
+ * shared-memory bridge, and non-bridge calls are forwarded to the real
+ * Wayland library which has been renamed to libwayland-client-real.so.0
+ * (use: patchelf --set-soname libwayland-client-real.so.0
+ * libwayland-client.so.0)
+ *
+ */
+
+#define _GNU_SOURCE
+#include "bridge_core.h"
+#include "gles_bridge_protocol.h"
+#include "pointer_wire.h"
+#define LOG_PREFIX "[wl_stub]"
+#include "shared_util.h"
+#include <assert.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/eventfd.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <time.h>
+#include <wayland-client.h>
+#include <wayland-cursor.h>
+#include <xkbcommon/xkbcommon.h>
+
+// #include "webos-input-manager.h"
+
+#define REAL(name) real_##name
+
+/* ── Handle to the real Wayland library ─────────────────────────────────── */
+#ifndef WL_REAL_LIB
+#define WL_REAL_LIB "libwayland-client-real.so.0"
+#endif
+
+#ifndef WL_CURSOR_LIB
+#define WL_CURSOR_LIB "libwayland-cursor.so.0"
+#endif
+
+static void *g_real_wl_lib = NULL;
+static void *g_real_wl_cursor_lib = NULL;
+
+static void *real_wl_lib(void)
+{
+  if (!g_real_wl_lib)
+  {
+    g_real_wl_lib = dlopen(WL_REAL_LIB, RTLD_NOW | RTLD_GLOBAL);
+    if (!g_real_wl_lib)
+      log_error("[wl_stub] FATAL: cannot open %s: %s", WL_REAL_LIB, dlerror());
+  }
+  return g_real_wl_lib;
+}
+
+static void *real_wl_cursor_lib(void)
+{
+  if (!g_real_wl_cursor_lib)
+  {
+    g_real_wl_cursor_lib = dlopen(WL_CURSOR_LIB, RTLD_NOW | RTLD_GLOBAL);
+    if (!g_real_wl_cursor_lib)
+      log_error("[wl_stub] FATAL: cannot open %s: %s", WL_CURSOR_LIB,
+                dlerror());
+  }
+  return g_real_wl_cursor_lib;
+}
+
+/* ── Real-function resolver ─────────────────────────────────────────────── */
+/*
+ * Each DECL_REAL() declares a function pointer and a constructor that resolves
+ * it from the real library at startup.  We use a priority of 101 so these run
+ * before any other constructors that might call into Wayland.
+ */
+#define DECL_REAL(ret, name, ...)                                              \
+  static ret (*real_##name)(__VA_ARGS__) = NULL;                               \
+  __attribute__((constructor(101))) static void _init_##name(void)             \
+  {                                                                            \
+    if (!real_##name)                                                          \
+    {                                                                          \
+      void *lib = real_wl_lib();                                               \
+      if (lib)                                                                 \
+        real_##name = dlsym(lib, #name);                                       \
+      if (!real_##name)                                                        \
+        log_error("[wl_stub] WARNING: cannot resolve %s from %s: %s\n", #name, \
+                  WL_REAL_LIB, dlerror());                                     \
+    }                                                                          \
+  }
+
+#define DECL_CURSOR_REAL(ret, name, ...)                                       \
+  static ret (*real_##name)(__VA_ARGS__) = NULL;                               \
+  __attribute__((constructor(101))) static void _init_##name(void)             \
+  {                                                                            \
+    if (!real_##name)                                                          \
+    {                                                                          \
+      void *lib = real_wl_cursor_lib();                                        \
+      if (lib)                                                                 \
+        real_##name = dlsym(lib, #name);                                       \
+      if (!real_##name)                                                        \
+        log_error("[wl_stub] WARNING: cannot resolve %s from %s: %s", #name,   \
+                  WL_CURSOR_LIB, dlerror());                                   \
+    }                                                                          \
+  }
+
+DECL_REAL(struct wl_display *, wl_display_connect, const char *)
+DECL_REAL(void, wl_display_disconnect, struct wl_display *)
+DECL_REAL(int, wl_display_get_fd, struct wl_display *)
+DECL_REAL(int, wl_display_dispatch, struct wl_display *)
+DECL_REAL(int, wl_display_dispatch_pending, struct wl_display *)
+DECL_REAL(int, wl_display_dispatch_queue, struct wl_display *,
+          struct wl_event_queue *)
+DECL_REAL(int, wl_display_dispatch_queue_pending, struct wl_display *,
+          struct wl_event_queue *)
+DECL_REAL(int, wl_display_roundtrip, struct wl_display *)
+DECL_REAL(int, wl_display_flush, struct wl_display *)
+DECL_REAL(int, wl_display_prepare_read, struct wl_display *)
+DECL_REAL(int, wl_display_prepare_read_queue, struct wl_display *,
+          struct wl_event_queue *)
+DECL_REAL(void, wl_display_cancel_read, struct wl_display *)
+DECL_REAL(int, wl_display_read_events, struct wl_display *)
+DECL_REAL(uint32_t, wl_proxy_get_version, struct wl_proxy *)
+DECL_REAL(uint32_t, wl_proxy_get_id, struct wl_proxy *)
+DECL_REAL(int, wl_proxy_add_listener, struct wl_proxy *, void (**)(void),
+          void *)
+DECL_REAL(void, wl_proxy_destroy, struct wl_proxy *)
+DECL_REAL(void, wl_proxy_marshal, struct wl_proxy *, uint32_t, ...)
+DECL_REAL(struct wl_proxy *, wl_proxy_marshal_constructor, struct wl_proxy *,
+          uint32_t, const struct wl_interface *, ...)
+DECL_REAL(struct wl_proxy *, wl_proxy_marshal_array_constructor,
+          struct wl_proxy *, uint32_t, union wl_argument *,
+          const struct wl_interface *)
+DECL_REAL(struct wl_proxy *, wl_proxy_marshal_constructor_versioned,
+          struct wl_proxy *, uint32_t, const struct wl_interface *, uint32_t,
+          ...)
+DECL_REAL(struct wl_proxy *, wl_proxy_marshal_array_constructor_versioned,
+          struct wl_proxy *, uint32_t, union wl_argument *,
+          const struct wl_interface *, uint32_t)
+DECL_REAL(struct wl_proxy *, wl_proxy_marshal_flags, struct wl_proxy *,
+          uint32_t, const struct wl_interface *, uint32_t, uint32_t, ...)
+DECL_CURSOR_REAL(struct wl_cursor_theme *, wl_cursor_theme_load, const char *,
+                 int, struct wl_shm *)
+DECL_CURSOR_REAL(struct wl_cursor *, wl_cursor_theme_get_cursor,
+                 struct wl_cursor_theme *, const char *)
+DECL_CURSOR_REAL(void, wl_cursor_theme_destroy, struct wl_cursor_theme *)
+
+// for SDL2:
+DECL_REAL(void, wl_proxy_set_user_data, struct wl_proxy *, void *)
+DECL_REAL(void *, wl_proxy_get_user_data, struct wl_proxy *)
+DECL_REAL(void, wl_proxy_set_tag, struct wl_proxy *, const char *const *)
+DECL_REAL(const char *const *, wl_proxy_get_tag, struct wl_proxy *)
+DECL_REAL(struct wl_event_queue *, wl_display_create_queue, struct wl_display *)
+DECL_REAL(void, wl_event_queue_destroy, struct wl_event_queue *)
+DECL_REAL(void *, wl_proxy_create_wrapper, void *)
+DECL_REAL(void, wl_proxy_wrapper_destroy, void *)
+DECL_REAL(void, wl_proxy_set_queue, struct wl_proxy *, struct wl_event_queue *)
+
+// for kodi
+DECL_REAL(int, wl_proxy_add_dispatcher, struct wl_proxy *, wl_dispatcher_func_t,
+          const void *, void *)
+
+/* ── Handle encoding ─────────────────────────────────────────────────────── */
+#define H2P(n) ((void *)(uintptr_t)(uint32_t)(n))
+#define P2H(p) ((uint32_t)(uintptr_t)(p))
+#define IS_BH(p) (P2H(p) > 0 && P2H(p) < 2048)
+
+#define BH_REGISTRY 1
+#define BH_COMPOSITOR 2
+#define BH_SHELL 3
+#define BH_WEBOS_SHELL 4
+#define BH_SHM 5
+#define BH_WEBOS_INPUT_MGR 6
+#define BH_SEAT_BASE 10
+#define BH_OUTPUT_BASE 20
+#define BH_KEYBOARD_BASE 30
+#define BH_POINTER_BASE 40
+#define BH_WEBOS_SEAT_BASE 50 /* up to MAX_SEATS: 50, 51 */
+#define BH_SURFACE_BASE 100
+#define BH_SHELL_SURF_BASE 200
+#define BH_WEBOS_SURF_BASE 300
+#define BH_STARFISH_POINTER 7
+#define BH_STARFISH_OUTPUT 8
+#define BH_WEBOS_FOREIGN 9
+#define BH_DUMMY_SYNC 0xFD
+#define BH_DUMMY 0xFE
+
+#define BH_WRAPPER_BASE 0x400 /* 1024 */
+#define MAX_WRAPPERS 64
+
+/* Maximum number of concurrently tracked surfaces per display connection   */
+#define SURF_MAP_MAX 8
+
+#define BRIDGE_MAGIC 0x42524944 /* "BRID" */
+
+typedef struct
+{
+  uint32_t magic;
+  uint32_t slot;
+} BridgeDisplay;
+
+#define IS_BRIDGE_DPY(p)                                                       \
+  ({                                                                           \
+    BridgeDisplay *bd = (BridgeDisplay *)(p);                                  \
+    (void *)bd >= (void *)&g_bridge_displays[1] &&                             \
+        (void *)bd <= (void *)&g_bridge_displays[EGL_BRIDGE_MAX_DISPLAYS] &&   \
+        bd->magic == BRIDGE_MAGIC;                                             \
+  })
+
+static BridgeDisplay g_bridge_displays[EGL_BRIDGE_MAX_DISPLAYS];
+static int g_active_bridge_displays = 0;
+
+#define IS_BRIDGE_PROXY(p) (IS_BH(p) || IS_BRIDGE_DPY(p))
+
+/* slot -> handle being wrapped (0 = free). Only ever holds small-int BH_*
+ * handles — display wrapping is handled separately below since it never
+ * touches waylandpp's proxy_data_t */
+static uint32_t g_wrapper_target[MAX_WRAPPERS];
+
+static int is_wrapper_handle(uint32_t h)
+{
+  return h >= BH_WRAPPER_BASE && h < BH_WRAPPER_BASE + MAX_WRAPPERS;
+}
+
+/* Resolve a wrapper handle through to the real bridge handle it wraps, so
+ * marshal/listener/dispatcher logic can treat a wrapper exactly like the
+ * object it wraps. Non-wrapper handles pass through unchanged. */
+static uint32_t resolve_handle(uint32_t h)
+{
+  int guard = 0;
+  while (is_wrapper_handle(h) && guard++ < MAX_WRAPPERS)
+  {
+    uint32_t target = g_wrapper_target[h - BH_WRAPPER_BASE];
+    if (!target)
+      break;
+    h = target;
+  }
+  return h;
+}
+
+/* ── Per-listener storage ────────────────────────────────────────────────── */
+#define MAX_SEATS 2
+#define MAX_OUTPUTS 4
+
+typedef struct
+{
+  void (**funcs)(void);
+  void *data;
+
+  /* used by waylandpp instead of the
+   * listener struct. wl_proxy_add_dispatcher() stores these. */
+  wl_dispatcher_func_t dispatch_fn;
+  const void
+      *dispatch_impl;  /* becomes proxy->object.implementation in real wl */
+  void *dispatch_data; /* becomes proxy->user_data in real wl */
+} listener_slot_t;
+
+/* ── Bridge state ────────────────────────────────────────────────────────── */
+typedef struct
+{
+  uint32_t id_watermark;
+  uint32_t num_seats;
+  uint32_t num_outputs;
+
+  /*
+   * surface_slot_map[i] = proxy slot for the i-th stub surface handle,
+   * where i = (stub_handle - BH_SURFACE_BASE).
+   * Indexed by the same offset for shell-surf and webos-surf handles.
+   */
+  uint32_t surface_slot_map[SURF_MAP_MAX];
+
+  /* Legacy: last-created proxy slot (used for ops that don't have a handle) */
+  uint32_t surface_proxy_slot;
+
+  /* Fake display fd that client polls */
+  int event_efd;
+
+  /* Next surface handle to hand out */
+  uint32_t next_surface;
+
+  /* Per-connect seat/output bind counters */
+  uint32_t seat_cnt;
+  uint32_t out_cnt;
+
+  /* Registry listener */
+  const struct wl_registry_listener *reg_listener;
+  void *reg_listener_data;
+
+  /* webOS shell surface listener — one per surface slot */
+  void (**webos_ss_listener)(void); /* legacy single-listener */
+  void *webos_ss_listener_data;
+  void (**webos_ss_listeners[SURF_MAP_MAX])(void);
+  void *webos_ss_listener_data_arr[SURF_MAP_MAX];
+
+  listener_slot_t seats[MAX_SEATS];
+  listener_slot_t outputs[MAX_OUTPUTS];
+
+/* Per-callback listener storage — indexed by handle offset from BH_DUMMY    */
+#define MAX_CALLBACKS 32
+#define BH_CALLBACK_BASE 0x200
+#define BRIDGE_DUMMY_QUEUE ((struct wl_event_queue *)((uintptr_t)1))
+
+  int output_events_pending[MAX_OUTPUTS]; /* 1 = need to fire events on next
+                                             dispatch */
+  int callback_pending[MAX_CALLBACKS];
+
+  listener_slot_t keyboards[MAX_SEATS];
+  listener_slot_t pointers[MAX_SEATS];
+
+  int globals_fired;
+  int keyboard_enter_sent;
+
+  uint32_t webos_seat_received;
+  uint32_t webos_seat_id;
+  uint32_t webos_seat_designator;
+  uint32_t webos_seat_capabilities;
+  char webos_seat_name[256];
+
+  listener_slot_t webos_seat_listeners[MAX_SEATS];
+  int webos_seat_info_fired[MAX_SEATS];
+
+  uint32_t active_surface_handle; // stub handle of surface that went fullscreen
+  uint32_t keyboard_focus_handle; // handle focus was actually sent to
+
+  uint32_t output_width;
+  uint32_t output_height;
+  uint32_t output_refresh;
+  uint32_t output_phys_w;
+  uint32_t output_phys_h;
+  uint32_t output_scale;
+
+  /* registry dispatcher path (waylandpp) */
+  wl_dispatcher_func_t reg_dispatch_fn;
+  const void *reg_dispatch_impl;
+  void *reg_dispatch_data;
+
+  /* webOS shell-surface dispatcher (waylandpp),
+   * existing webos_ss_listener / webos_ss_listeners[] fields */
+  wl_dispatcher_func_t webos_ss_dispatch_fn;
+  const void *webos_ss_dispatch_impl;
+  void *webos_ss_dispatch_data;
+  wl_dispatcher_func_t webos_ss_dispatch_fn_arr[SURF_MAP_MAX];
+  const void *webos_ss_dispatch_impl_arr[SURF_MAP_MAX];
+  void *webos_ss_dispatch_data_arr[SURF_MAP_MAX];
+
+  uint32_t seat_caps_pending[MAX_SEATS]; /* fire capabilities next dispatch */
+
+} wl_bridge_state_t;
+
+static wl_bridge_state_t g_bs;
+
+struct wl_webos_shell_surface;
+struct wl_webos_seat;
+
+#define MAX_PROXY_TAGS 2048
+static const char *const *g_proxy_tags[MAX_PROXY_TAGS];
+
+typedef struct
+{
+  void (**funcs)(void);
+  void *data;
+  int pending; /* 1 = done event not yet delivered */
+
+  wl_dispatcher_func_t dispatch_fn;
+  const void *dispatch_impl;
+  void *dispatch_data;
+} CallbackSlot;
+
+static CallbackSlot g_callbacks[MAX_CALLBACKS];
+static uint32_t g_callback_next = 0;
+
+extern const struct wl_interface wl_surface_interface;
+
+static const struct wl_message _msg_registry_global = {"global", "usu", NULL};
+static const struct wl_message _msg_registry_global_remove = {"global_remove",
+                                                              "u", NULL};
+
+static const struct wl_message _msg_seat_capabilities = {"capabilities", "u",
+                                                         NULL};
+static const struct wl_message _msg_seat_name = {"name", "s", NULL};
+
+static const struct wl_message _msg_output_geometry = {"geometry", "iiiiissi",
+                                                       NULL};
+static const struct wl_message _msg_output_mode = {"mode", "uiii", NULL};
+static const struct wl_message _msg_output_done = {"done", "", NULL};
+static const struct wl_message _msg_output_scale = {"scale", "i", NULL};
+
+static const struct wl_interface *_msg_kbd_enter_types[] = {
+    NULL, &wl_surface_interface, NULL};
+static const struct wl_message _msg_keyboard_keymap = {"keymap", "uhu", NULL};
+static const struct wl_message _msg_keyboard_enter = {"enter", "uo?a",
+                                                      _msg_kbd_enter_types};
+static const struct wl_message _msg_keyboard_key = {"key", "uuuu", NULL};
+
+static const struct wl_message _msg_callback_done = {"done", "u", NULL};
+
+static const struct wl_message _msg_webos_ss_state_changed = {"state_changed",
+                                                              "u", NULL};
+
+static char *g_stub_keymap_string = NULL;
+static uint32_t g_stub_keymap_size = 0;
+static uint8_t g_all_lazy_caps_done = 0;
+
+static void _normalize_proxy_keymap(void)
+{
+  struct xkb_context *context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+  if (!context)
+  {
+    fprintf(stderr, "[wl_stub] cannot create xkb context; preserving received keymap\n");
+    return;
+  }
+
+  if (g_stub_keymap_string && g_stub_keymap_size > 0)
+  {
+    struct xkb_keymap *original = xkb_keymap_new_from_string(
+        context, g_stub_keymap_string, XKB_KEYMAP_FORMAT_TEXT_V1,
+        XKB_KEYMAP_COMPILE_NO_FLAGS);
+    if (original)
+    {
+      xkb_keymap_unref(original);
+      xkb_context_unref(context);
+      return; /* Keep the valid LG keymap byte-for-byte unchanged. */
+    }
+    fprintf(stderr, "[wl_stub] LG keymap is invalid; trying evdev/pc105/us fallback\n");
+  }
+  else
+  {
+    fprintf(stderr, "[wl_stub] LG keymap unavailable; trying evdev/pc105/us fallback\n");
+  }
+
+  const struct xkb_rule_names rules = {
+      .rules = "evdev", .model = "pc105", .layout = "us", .variant = NULL,
+      .options = NULL};
+  struct xkb_keymap *fallback = xkb_keymap_new_from_names(
+      context, &rules, XKB_KEYMAP_COMPILE_NO_FLAGS);
+  if (!fallback)
+  {
+    fprintf(stderr, "[wl_stub] evdev/pc105/us fallback failed; preserving received keymap\n");
+    xkb_context_unref(context);
+    return;
+  }
+
+  char *serialized = xkb_keymap_get_as_string(fallback, XKB_KEYMAP_FORMAT_TEXT_V1);
+  if (!serialized)
+  {
+    fprintf(stderr, "[wl_stub] fallback serialization failed; preserving received keymap\n");
+    xkb_keymap_unref(fallback);
+    xkb_context_unref(context);
+    return;
+  }
+
+  const size_t serialized_size = strlen(serialized) + 1;
+  if (serialized_size > UINT32_MAX)
+  {
+    fprintf(stderr, "[wl_stub] fallback keymap is too large; preserving received keymap\n");
+    free(serialized);
+    xkb_keymap_unref(fallback);
+    xkb_context_unref(context);
+    return;
+  }
+
+  free(g_stub_keymap_string);
+  g_stub_keymap_string = serialized;
+  g_stub_keymap_size = (uint32_t)serialized_size;
+  fprintf(stderr, "[wl_stub] using evdev/pc105/us fallback keymap (%u bytes)\n",
+          g_stub_keymap_size);
+  xkb_keymap_unref(fallback);
+  xkb_context_unref(context);
+}
+
+static void _fetch_proxy_keymap(void)
+{
+  BRIDGE_BEGIN_WL();
+  BridgeCtrl *C = BRIDGE_CTRL_WL();
+  C->opcode = OP_wl_get_keymap;
+  C->args_len = 0;
+  C->data_offset = 0;
+  C->data_size = 0;
+  bridge_send_call_wl();
+
+  if (C->result == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 && C->data_size > 0)
+  {
+    char *received = malloc((size_t)C->data_size + 1);
+    if (received)
+    {
+      bridge_data_read_wl(received, C->data_offset, C->data_size);
+      received[C->data_size] = '\0';
+      free(g_stub_keymap_string);
+      g_stub_keymap_string = received;
+      g_stub_keymap_size = C->data_size;
+#ifdef DEBUG_WAYLAND
+      log_console("_fetch_proxy_keymap: fetched %u bytes", g_stub_keymap_size);
+#endif
+    }
+    else
+    {
+      fprintf(stderr, "[wl_stub] cannot allocate received keymap; preserving prior keymap\n");
+    }
+  }
+#ifdef DEBUG_WAYLAND
+  else
+    log_console("_fetch_proxy_keymap: proxy has no keymap yet (result=%u)",
+                C->result);
+#endif
+
+  _normalize_proxy_keymap();
+}
+
+/* ── Per-proxy user-data table ───────────────────────────────────────────── */
+/* Bridge proxy handles are small integers cast to pointers (max ~2048). */
+#define MAX_PROXY_USERDATA 2048
+static void *g_proxy_userdata[MAX_PROXY_USERDATA];
+
+static uint32_t alloc_callback(void)
+{
+  uint32_t idx = g_callback_next % MAX_CALLBACKS;
+  g_callback_next++;
+  g_callbacks[idx].funcs = NULL;
+  g_callbacks[idx].data = NULL;
+  g_callbacks[idx].pending = 0;
+  g_callbacks[idx].dispatch_fn = NULL;
+  g_callbacks[idx].dispatch_impl = NULL;
+  g_callbacks[idx].dispatch_data = NULL;
+  return idx;
+}
+
+static int is_callback_handle(uint32_t h)
+{
+  return h >= BH_CALLBACK_BASE && h < BH_CALLBACK_BASE + MAX_CALLBACKS;
+}
+
+/* Called from wl_proxy_add_listener when h is a callback handle */
+static void _fire_callback_done(uint32_t idx)
+{
+  CallbackSlot *s = &g_callbacks[idx];
+  void *cb_handle = (void *)H2P(BH_CALLBACK_BASE + idx);
+
+  if (s->funcs && s->funcs[0])
+  {
+    typedef void (*done_fn)(void *, struct wl_callback *, uint32_t);
+    ((done_fn)s->funcs[0])(s->data, (struct wl_callback *)cb_handle, 0);
+    return;
+  }
+  if (s->dispatch_fn)
+  {
+    union wl_argument args[1];
+    args[0].u = 0;
+    s->dispatch_fn(s->dispatch_impl, cb_handle, 0, &_msg_callback_done, args);
+  }
+}
+
+static void _fire_output_events(uint32_t idx);
+
+/* ── Helpers: slot lookup ────────────────────────────────────────────────── */
+
+/*
+ * slot_for_surface(stub_handle) — maps a stub surface handle to the proxy
+ * slot returned by OP_wl_compositor_create_surface.
+ */
+static uint32_t slot_for_surface(uint32_t h)
+{
+#ifdef DEBUG_WAYLAND_VERBOSE
+  log_console("slot_for_surface - h:%d", h);
+#endif
+  uint32_t idx = h - BH_SURFACE_BASE;
+  if (idx < SURF_MAP_MAX)
+    return g_bs.surface_slot_map[idx];
+#ifdef DEBUG_WAYLAND
+  log_console("slot_for_surface - returning 0");
+#endif
+  return 0;
+}
+
+/* Same index for shell-surf and webos-surf handles (offset from their base) */
+static uint32_t slot_for_shellsurf(uint32_t h)
+{
+  uint32_t idx = h - BH_SHELL_SURF_BASE;
+  if (idx < SURF_MAP_MAX)
+    return g_bs.surface_slot_map[idx];
+#ifdef DEBUG_WAYLAND
+  log_console("slot_for_shellsurf - returning 0");
+#endif
+  return 0;
+}
+
+static uint32_t slot_for_webosurf(uint32_t h)
+{
+  uint32_t idx = h - BH_WEBOS_SURF_BASE;
+  if (idx < SURF_MAP_MAX)
+    return g_bs.surface_slot_map[idx];
+#ifdef DEBUG_WAYLAND
+  log_console("slot_for_webosurf - returning 0");
+#endif
+  return 0;
+}
+
+/* ── Internal: fire globals / dispatch ──────────────────────────────────── */
+static void _fire_globals(void)
+{
+  if (!g_bs.reg_listener && !g_bs.reg_dispatch_fn)
+    return;
+
+  struct wl_registry *reg = (struct wl_registry *)H2P(BH_REGISTRY);
+
+#define EMIT_GLOBAL(id, iface_name, ver)                                       \
+  do                                                                           \
+  {                                                                            \
+    const struct wl_registry_listener *_L = g_bs.reg_listener;                 \
+    if (_L && _L->global)                                                      \
+      _L->global(g_bs.reg_listener_data, reg, (id), (iface_name), (ver));      \
+                                                                               \
+    wl_dispatcher_func_t _dfn = g_bs.reg_dispatch_fn;                          \
+    if (_dfn)                                                                  \
+    {                                                                          \
+      union wl_argument _args[3];                                              \
+      _args[0].u = (id);                                                       \
+      _args[1].s = (iface_name);                                               \
+      _args[2].u = (ver);                                                      \
+      _dfn(g_bs.reg_dispatch_impl, reg, 0, &_msg_registry_global, _args);      \
+    }                                                                          \
+  } while (0)
+
+  if (!g_bs.globals_fired)
+  {
+    g_bs.globals_fired = 1;
+
+    EMIT_GLOBAL(BH_COMPOSITOR, "wl_compositor", 4);
+    EMIT_GLOBAL(BH_SHELL, "wl_shell", 1);
+    EMIT_GLOBAL(BH_WEBOS_SHELL, "wl_webos_shell", 2);
+    EMIT_GLOBAL(BH_SHM, "wl_shm", 1);
+    for (uint32_t i = 0; i < g_bs.num_seats && i < MAX_SEATS; i++)
+      EMIT_GLOBAL(BH_SEAT_BASE + i, "wl_seat", 5);
+    for (uint32_t i = 0; i < g_bs.num_outputs && i < MAX_OUTPUTS; i++)
+      EMIT_GLOBAL(BH_OUTPUT_BASE + i, "wl_output", 3);
+    EMIT_GLOBAL(BH_WEBOS_INPUT_MGR, "wl_webos_input_manager", 1);
+    EMIT_GLOBAL(BH_STARFISH_POINTER, "wl_starfish_pointer", 1);
+    EMIT_GLOBAL(BH_STARFISH_OUTPUT, "wl_starfish_output", 1);
+    EMIT_GLOBAL(BH_WEBOS_FOREIGN, "wl_webos_foreign", 1);
+  }
+
+#undef EMIT_GLOBAL
+}
+
+/* Drain keyboard events and webOS shell surface state events packed by
+ * the proxy into result_buf.
+ *
+ * Layout (uint32_t words):
+ *   [0]                  keyboard event count N
+ *   [1 .. 1+N*2-1]       key/state pairs
+ *   [BASE]               webOS state event count M   (BASE = 1+INPUT_EVT_MAX*2)
+ *   [BASE+1 .. BASE+M*2] proxy_slot/state pairs
+ */
+#define WEBOS_STATE_BASE (1 + INPUT_EVT_MAX * 3)
+
+static void _fire_keyboard_focus_to(uint32_t surf_handle)
+{
+#ifdef DEBUG_WAYLAND_VERBOSE
+  log_console("_fire_keyboard_focus_to: surf_handle=%u", surf_handle);
+#endif
+
+  struct wl_surface *surf = (struct wl_surface *)H2P(surf_handle);
+  bool delivered = false;
+
+  for (uint32_t s = 0; s < MAX_SEATS; s++)
+  {
+    listener_slot_t *kb = &g_bs.keyboards[s];
+    if (!kb->funcs && !kb->dispatch_fn)
+    {
+#ifdef DEBUG_WAYLAND_VERBOSE
+      if (!kb->funcs)
+        log_console("_fire_keyboard_focus_to: no kb->funcs for seat_%u", s);
+      if (!kb->dispatch_fn)
+        log_console("_fire_keyboard_focus_to: no kb->dispatch_fn for seat_%u",
+                    s);
+#endif
+      continue;
+    }
+
+#ifdef DEBUG_WAYLAND
+    log_console("_fire_keyboard_focus_to: seat_%u surface %p surf_handle:%u", s,
+                surf, surf_handle);
+#endif
+
+    /* Build keymap fd once per seat that has a listener */
+    int kfd = -1;
+    if (g_stub_keymap_string && g_stub_keymap_size > 0)
+    {
+      kfd = memfd_create("xkb-keymap", MFD_CLOEXEC);
+      if (kfd < 0)
+        kfd = open("/tmp/xkb-keymap-bridge", O_RDWR | O_CREAT | O_TRUNC, 0600);
+      if (kfd >= 0)
+      {
+        write(kfd, g_stub_keymap_string, g_stub_keymap_size);
+        lseek(kfd, 0, SEEK_SET);
+      }
+    }
+
+    void *kb_handle = (void *)H2P(BH_KEYBOARD_BASE + s);
+
+    if (kb->funcs)
+    {
+      log_console("_fire_keyboard_focus_to: delivering via funcs seat_%u", s);
+      if (kb->funcs[0])
+      {
+        typedef void (*keymap_fn)(void *, struct wl_keyboard *, uint32_t,
+                                  int32_t, uint32_t);
+        if (kfd >= 0)
+          ((keymap_fn)kb->funcs[0])(kb->data, kb_handle,
+                                    WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, kfd,
+                                    g_stub_keymap_size);
+        else
+          ((keymap_fn)kb->funcs[0])(kb->data, kb_handle, 0, -1, 0);
+      }
+      if (kb->funcs[1])
+      {
+        typedef void (*enter_fn)(void *, struct wl_keyboard *, uint32_t,
+                                 struct wl_surface *, struct wl_array *);
+        struct wl_array empty = {0, 0, NULL};
+        ((enter_fn)kb->funcs[1])(kb->data, kb_handle, 1, surf, &empty);
+      }
+      delivered = true;
+    }
+
+    if (kb->dispatch_fn)
+    {
+#ifdef DEBUG_WAYLAND
+      log_console("_fire_keyboard_focus_to: delivering via dispatch_fn seat_%u",
+                  s);
+#endif
+      if (kfd >= 0)
+      {
+        union wl_argument km[3];
+        km[0].u = WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1;
+        km[1].h = kfd;
+        km[2].u = g_stub_keymap_size;
+        kb->dispatch_fn(kb->dispatch_impl, kb_handle, 0, &_msg_keyboard_keymap,
+                        km);
+      }
+      struct wl_array empty = {0, 0, NULL};
+      union wl_argument ea[3];
+      ea[0].u = 1;
+      ea[1].o = (struct wl_object *)surf;
+      ea[2].a = &empty;
+      kb->dispatch_fn(kb->dispatch_impl, kb_handle, 1, &_msg_keyboard_enter,
+                      ea);
+      delivered = true;
+    }
+
+    if (kfd >= 0)
+      close(kfd);
+  }
+
+  /* only lock in the "sent" state if we actually reached a listener */
+  if (delivered)
+  {
+#ifdef DEBUG_WAYLAND
+    log_console("_fire_keyboard_focus_to: enter delivered, locking sent=1");
+#endif
+    g_bs.keyboard_focus_handle = surf_handle;
+    g_bs.keyboard_enter_sent = 1;
+  }
+#ifdef DEBUG_WAYLAND_VERBOSE
+  else
+  {
+    log_console("_fire_keyboard_focus_to: no listener yet, will retry");
+  }
+#endif
+}
+
+/* ── Give keyboard focus ─────────────── */
+static void _fire_keyboard_focus(void)
+{
+#ifdef DEBUG_WAYLAND_VERBOSE
+  log_console("_fire_keyboard_focus: keyboard_enter_sent=%d next_surface=%u",
+              g_bs.keyboard_enter_sent, g_bs.next_surface);
+#endif
+  if (g_bs.keyboard_enter_sent)
+    return;
+
+  /* No explicit webOS state event yet — fall back to first created surface */
+  if (!g_bs.active_surface_handle)
+  {
+    if (g_bs.next_surface <= BH_SURFACE_BASE)
+      return;                                     /* no surface created yet */
+    g_bs.active_surface_handle = BH_SURFACE_BASE; /* first surface, slot 0 */
+#ifdef DEBUG_WAYLAND_VERBOSE
+    log_console("_fire_keyboard_focus: no webOS state event, "
+                "using first surface h=%u",
+                g_bs.active_surface_handle);
+#endif
+  }
+
+  _fire_keyboard_focus_to(g_bs.active_surface_handle);
+}
+
+static void _fire_seat_capabilities(uint32_t idx)
+{
+  listener_slot_t *s = &g_bs.seats[idx];
+
+#ifdef DEBUG_WAYLAND
+  log_console(
+      "_fire_seat_capabilities idx=%u funcs=%p dispatch=%p dispatch_impl=%p",
+      idx, s->funcs, s->dispatch_fn, s->dispatch_impl);
+#endif
+
+  if (!s->funcs && !s->dispatch_fn)
+  {
+#ifdef DEBUG_WAYLAND
+    if (!s->funcs)
+      log_console("_fire_seat_capabilities: !s->funcs for seat %u", idx);
+    if (!s->dispatch_fn)
+      log_console("_fire_seat_capabilities: !s->dispatch_fn for seat %u", idx);
+#endif
+    return;
+  }
+
+  if (s->funcs)
+  {
+    if (s->funcs[0])
+    {
+      typedef void (*cap_fn)(void *, struct wl_seat *, uint32_t);
+      ((cap_fn)s->funcs[0])(s->data, (struct wl_seat *)H2P(BH_SEAT_BASE + idx),
+                            3u /* POINTER|KEYBOARD */);
+    }
+    if (s->funcs[1])
+    {
+      typedef void (*name_fn)(void *, struct wl_seat *, const char *);
+      ((name_fn)s->funcs[1])(s->data, (struct wl_seat *)H2P(BH_SEAT_BASE + idx),
+                             "default");
+    }
+    return;
+  }
+
+  if (s->dispatch_fn)
+  {
+    void *h = (void *)H2P(BH_SEAT_BASE + idx);
+
+#ifdef DEBUG_WAYLAND
+    log_console("_fire_seat_capabilities: dispatch seat %u h %d impl %p", idx,
+                h, s->dispatch_impl);
+#endif
+
+    union wl_argument cap_args[1];
+    cap_args[0].u = 3u;
+    int ret = s->dispatch_fn(s->dispatch_impl, h, 0, &_msg_seat_capabilities,
+                             cap_args);
+
+#ifdef DEBUG_WAYLAND
+    log_console("_fire_seat_capabilities: cap_args returned %d", ret);
+#endif
+
+    union wl_argument name_args[1];
+    name_args[0].s = "default";
+    ret = s->dispatch_fn(s->dispatch_impl, h, 1, &_msg_seat_name, name_args);
+
+#ifdef DEBUG_WAYLAND
+    log_console("_fire_seat_capabilities: name_args returned %d", ret);
+#endif
+  }
+}
+
+static const struct wl_interface *pp_enter_types[] = {NULL, &wl_surface_interface, NULL, NULL};
+static const struct wl_interface *pp_leave_types[] = {NULL, &wl_surface_interface};
+static const struct wl_message pp_pointer_messages[] = {
+    {"enter", "uoff", pp_enter_types}, {"leave", "uo", pp_leave_types},
+    {"motion", "uff", NULL}, {"button", "uuuu", NULL}, {"axis", "uuf", NULL}};
+static uint32_t pp_pointer_serial = 1;
+static uint8_t pp_pointer_entered[MAX_SEATS];
+static uint32_t pp_pointer_surface[MAX_SEATS];
+static wl_fixed_t pp_pointer_x[MAX_SEATS], pp_pointer_y[MAX_SEATS];
+
+static uint32_t pp_surface_handle(uint32_t slot)
+{
+  for (uint32_t i = 0; i < SURF_MAP_MAX; ++i)
+    if (g_bs.surface_slot_map[i] == slot)
+      return BH_SURFACE_BASE + i;
+  return g_bs.active_surface_handle;
+}
+
+static void pp_deliver_pointer(uint32_t tag, uint32_t a, uint32_t b)
+{
+  uint32_t seat = PP_POINTER_SEAT(tag);
+  uint32_t kind = tag & PP_POINTER_TYPE_MASK;
+  if (seat >= MAX_SEATS) return;
+  listener_slot_t *p = &g_bs.pointers[seat];
+  if (!p->funcs && !p->dispatch_fn) return;
+  struct wl_pointer *handle = (struct wl_pointer *)H2P(BH_POINTER_BASE + seat);
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  uint32_t time = (uint32_t)((uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+  uint32_t serial = pp_pointer_serial++;
+  union wl_argument args[4] = {{0}};
+  unsigned opcode;
+  if ((kind == PP_POINTER_MOTION || kind == PP_POINTER_BUTTON) && !pp_pointer_entered[seat]) {
+    pp_deliver_pointer(PP_POINTER_ENTER | seat |
+        ((PP_POINTER_SLOT(tag)) << 8), kind == PP_POINTER_MOTION ? a : pp_pointer_x[seat],
+        kind == PP_POINTER_MOTION ? b : pp_pointer_y[seat]);
+  }
+  switch (kind) {
+  case PP_POINTER_ENTER: {
+    opcode = 0;
+    pp_pointer_surface[seat] = pp_surface_handle(PP_POINTER_SLOT(tag));
+    pp_pointer_x[seat] = (wl_fixed_t)a; pp_pointer_y[seat] = (wl_fixed_t)b;
+    pp_pointer_entered[seat] = 1;
+    struct wl_surface *surface = (struct wl_surface *)H2P(pp_pointer_surface[seat]);
+    args[0].u = serial; args[1].o = (struct wl_object *)surface;
+    args[2].f = (wl_fixed_t)a; args[3].f = (wl_fixed_t)b;
+    if (p->funcs && p->funcs[0])
+      ((void (*)(void *, struct wl_pointer *, uint32_t, struct wl_surface *, wl_fixed_t, wl_fixed_t))p->funcs[0])
+          (p->data, handle, serial, surface, (wl_fixed_t)a, (wl_fixed_t)b);
+    fprintf(stderr, "[pp-pointer] enter seat=%u surface=%u x=%d y=%d\n", seat,
+        pp_pointer_surface[seat], wl_fixed_to_int((wl_fixed_t)a), wl_fixed_to_int((wl_fixed_t)b));
+    break;
+  }
+  case PP_POINTER_LEAVE: {
+    opcode = 1;
+    struct wl_surface *surface = (struct wl_surface *)H2P(pp_pointer_surface[seat]);
+    args[0].u = serial; args[1].o = (struct wl_object *)surface;
+    if (p->funcs && p->funcs[1])
+      ((void (*)(void *, struct wl_pointer *, uint32_t, struct wl_surface *))p->funcs[1])
+          (p->data, handle, serial, surface);
+    pp_pointer_entered[seat] = 0;
+    break;
+  }
+  case PP_POINTER_MOTION:
+    opcode = 2; args[0].u = time; args[1].f = (wl_fixed_t)a; args[2].f = (wl_fixed_t)b;
+    pp_pointer_x[seat] = (wl_fixed_t)a; pp_pointer_y[seat] = (wl_fixed_t)b;
+    if (p->funcs && p->funcs[2])
+      ((void (*)(void *, struct wl_pointer *, uint32_t, wl_fixed_t, wl_fixed_t))p->funcs[2])
+          (p->data, handle, time, (wl_fixed_t)a, (wl_fixed_t)b);
+    break;
+  case PP_POINTER_BUTTON:
+    opcode = 3; args[0].u = serial; args[1].u = time; args[2].u = a; args[3].u = b;
+    if (p->funcs && p->funcs[3])
+      ((void (*)(void *, struct wl_pointer *, uint32_t, uint32_t, uint32_t, uint32_t))p->funcs[3])
+          (p->data, handle, serial, time, a, b);
+    fprintf(stderr, "[pp-pointer] button=%u state=%u x=%d y=%d\n", a, b,
+        wl_fixed_to_int(pp_pointer_x[seat]), wl_fixed_to_int(pp_pointer_y[seat]));
+    break;
+  case PP_POINTER_AXIS:
+    opcode = 4; args[0].u = time; args[1].u = a; args[2].f = (wl_fixed_t)b;
+    if (p->funcs && p->funcs[4])
+      ((void (*)(void *, struct wl_pointer *, uint32_t, uint32_t, wl_fixed_t))p->funcs[4])
+          (p->data, handle, time, a, (wl_fixed_t)b);
+    break;
+  default: return;
+  }
+  if (p->dispatch_fn)
+    p->dispatch_fn(p->dispatch_impl, handle, opcode, &pp_pointer_messages[opcode], args);
+}
+
+static void _deliver_input_events(void)
+{
+  BridgeCtrl *C = BRIDGE_CTRL_WL();
+  const uint32_t *rb = (const uint32_t *)C->result_buf;
+
+  /* lazy seat capability firing - due to kodi. */
+  if (!g_all_lazy_caps_done)
+  {
+    for (uint32_t s = 0; s < MAX_SEATS; s++)
+    {
+      if (!g_bs.keyboards[s].funcs && !g_bs.keyboards[s].dispatch_fn &&
+          g_bs.seats[s].dispatch_fn)
+      {
+#ifdef DEBUG_WAYLAND
+        log_console("_deliver_input_events: lazy seat caps seat=%u", s);
+#endif
+        _fire_seat_capabilities(s);
+
+        /* If caps created the keyboard listener, immediately send
+         * keymap + enter so Kodi's XKB state is initialised before
+         * we deliver the key below. */
+        if ((g_bs.keyboards[s].funcs || g_bs.keyboards[s].dispatch_fn) &&
+            !g_bs.keyboard_enter_sent)
+        {
+          _fire_keyboard_focus();
+          g_all_lazy_caps_done = 1;
+        }
+      }
+    }
+  }
+
+  /* ── keyboard events ── */
+  uint32_t count = rb[0] < INPUT_EVT_MAX ? rb[0] : INPUT_EVT_MAX;
+#ifdef DEBUG_WAYLAND
+  if (count > 0)
+    log_console("_deliver_input_events: delivering %u input events", count);
+#endif
+  for (uint32_t i = 0; i < count; i++)
+  {
+    uint32_t tag = rb[1 + i * 3];
+    uint32_t key = rb[2 + i * 3];
+    uint32_t state = rb[3 + i * 3];
+    if (tag & PP_POINTER_TYPE_MASK) {
+      pp_deliver_pointer(tag, key, state);
+      continue;
+    }
+
+    /* LG G5 remote Back was measured as Linux evdev 412 (KEY_PREVIOUS).
+     * Also accept standard Back/Exit 158/174. SDL's generic
+     * key map otherwise drops AC_BACK/AC_EXIT before PPSSPP can use them. */
+    if (key >= 128)
+      fprintf(stderr, "[pp-remote] linux key=%u state=%u%s\n", key, state,
+          (key == 158 || key == 174 || key == 412) ? " -> Escape" : "");
+    if (key == 158 || key == 174 || key == 412)
+      key = 1; /* KEY_ESC: open the pause menu / go back one UI level. */
+
+#ifdef DEBUG_WAYLAND
+    if (state == 1) // WL_KEYBOARD_KEY_STATE_PRESSED
+      log_console("_deliver_input_events: KEY DOWN: key=%u state=%u i=%u", key,
+                  state, i);
+#endif
+
+    for (uint32_t s = 0; s < g_bs.num_seats && s < MAX_SEATS; s++)
+    {
+      listener_slot_t *kb = &g_bs.keyboards[s];
+
+      /* Skip seats with no listener of either kind */
+      if (!kb->funcs && !kb->dispatch_fn)
+      {
+#ifdef DEBUG_WAYLAND
+        if (state == 1) // WL_KEYBOARD_KEY_STATE_PRESSED
+          log_console(
+              "_deliver_input_events: no listener for key=%u state=%u "
+              "i=%u s=%u kb->funcs=%p kb->dispatch_fn=%p kb->dispatch_impl=%p",
+              key, state, i, s, kb->funcs, kb->dispatch_fn, kb->dispatch_impl);
+#endif
+        continue;
+      }
+
+      if (kb->funcs && kb->funcs[3])
+      {
+        typedef void (*key_fn)(void *, struct wl_keyboard *, uint32_t, uint32_t,
+                               uint32_t, uint32_t);
+        ((key_fn)kb->funcs[3])(kb->data,
+                               (struct wl_keyboard *)H2P(BH_KEYBOARD_BASE + s),
+                               0 /* serial */, 0 /* time */, key, state);
+      }
+
+      if (kb->dispatch_fn)
+      {
+#ifdef DEBUG_WAYLAND
+        if (state == 1) // WL_KEYBOARD_KEY_STATE_PRESSED
+          log_console("_deliver_input_events: KEY DOWN: kb->dispatch_fn=%p "
+                      "kb->dispatch_impl=%p key=%u "
+                      "state=%u i=%u s=%u",
+                      kb->dispatch_fn, kb->dispatch_impl, key, state, i, s);
+#endif
+        void *kb_handle = (void *)H2P(BH_KEYBOARD_BASE + s);
+        union wl_argument key_args[4];
+        key_args[0].u = 0;
+        key_args[1].u = 0;
+        key_args[2].u = key;
+        key_args[3].u = state;
+        kb->dispatch_fn(kb->dispatch_impl, kb_handle, 3, &_msg_keyboard_key,
+                        key_args);
+      }
+    }
+  }
+
+  /* ── webOS shell surface state_changed events ── */
+  uint32_t wss_count = rb[WEBOS_STATE_BASE];
+  const uint32_t *wss = rb + WEBOS_STATE_BASE + 1;
+
+#ifdef DEBUG_WAYLAND
+  if (wss_count > 0)
+    log_console("_deliver_input_events: wss_count:%u", wss_count);
+#endif
+
+  for (uint32_t i = 0; i < wss_count; i++)
+  {
+    uint32_t proxy_slot = wss[i * 2 + 0]; /* 0-based proxy slot */
+    uint32_t wstate = wss[i * 2 + 1];
+
+    /* stub surface index: proxy slots are 1-based, stub offsets 0-based */
+    uint32_t stub_idx = proxy_slot > 0 ? proxy_slot - 1 : 0;
+
+    uint32_t new_surf_handle = BH_SURFACE_BASE + stub_idx;
+
+    if (!g_bs.active_surface_handle)
+      g_bs.active_surface_handle = new_surf_handle;
+
+    if (wstate == 3 && g_bs.keyboard_enter_sent &&
+        g_bs.keyboard_focus_handle != new_surf_handle)
+    {
+#ifdef DEBUG_WAYLAND
+      log_console("_deliver_input_events: re-focusing keyboard "
+                  "from 0x%x to 0x%x (stub_idx=%u)",
+                  g_bs.keyboard_focus_handle, new_surf_handle, stub_idx);
+#endif
+      _fire_keyboard_focus_to(new_surf_handle);
+    }
+
+#ifdef DEBUG_WAYLAND
+    log_console("_deliver_input_events: wss state proxy_slot=%u wstate=%u "
+                "stub_idx=%u g_bs.webos_ss_listeners[stub_idx]=%p "
+                "g_bs.webos_ss_listener=%p g_bs.active_surface_handle=%p "
+                "g_bs.keyboard_enter_sent=%d",
+                proxy_slot, wstate, stub_idx, g_bs.webos_ss_listeners[stub_idx],
+                g_bs.webos_ss_listener, g_bs.active_surface_handle,
+                g_bs.keyboard_enter_sent);
+#endif
+
+    struct wl_webos_shell_surface *surf_h =
+        (struct wl_webos_shell_surface *)H2P(BH_WEBOS_SURF_BASE + stub_idx);
+
+    /* prefer per-surface listener, fall back to global */
+    void (**listener)(void) = NULL;
+    void *ldata = NULL;
+    wl_dispatcher_func_t dfn = NULL;
+    const void *dimpl = NULL;
+
+    if (stub_idx < SURF_MAP_MAX && g_bs.webos_ss_listeners[stub_idx])
+    {
+      listener = g_bs.webos_ss_listeners[stub_idx];
+      ldata = g_bs.webos_ss_listener_data_arr[stub_idx];
+    }
+    else if (g_bs.webos_ss_listener)
+    {
+      listener = g_bs.webos_ss_listener;
+      ldata = g_bs.webos_ss_listener_data;
+    }
+    else if (stub_idx < SURF_MAP_MAX && g_bs.webos_ss_dispatch_fn_arr[stub_idx])
+    {
+      dfn = g_bs.webos_ss_dispatch_fn_arr[stub_idx];
+      dimpl = g_bs.webos_ss_dispatch_impl_arr[stub_idx];
+    }
+    else if (g_bs.webos_ss_dispatch_fn)
+    {
+      dfn = g_bs.webos_ss_dispatch_fn;
+      dimpl = g_bs.webos_ss_dispatch_impl;
+    }
+
+    if (!listener && !dfn)
+    {
+      log_error("_deliver_input_events: NO LISTENER");
+      continue;
+    }
+
+    if (listener)
+    {
+      if (listener[0])
+      {
+        typedef void (*sc_fn)(void *, struct wl_webos_shell_surface *,
+                              uint32_t);
+        ((sc_fn)listener[0])(ldata, surf_h, wstate);
+      }
+    }
+    else
+    {
+      union wl_argument args[1];
+      args[0].u = wstate;
+      dfn(dimpl, surf_h, 0, &_msg_webos_ss_state_changed, args);
+    }
+  }
+}
+
+static void dispatch_unlocked(void)
+{
+  _fire_globals();
+
+  /* Fire any deferred seat capabilities */
+  /*for (uint32_t i = 0; i < MAX_SEATS; i++)
+  {
+    if (g_bs.seat_caps_pending[i])
+    {
+      g_bs.seat_caps_pending[i] = 0;
+#ifdef DEBUG_WAYLAND
+      log_console("_bridge_dispatch: firing deferred seat caps for seat %u", i);
+#endif
+      _fire_seat_capabilities(i);
+    }
+  }*/
+
+  /* ── deliver pending output events (deferred from wl_proxy_add_listener) ──
+   * Must happen after _fire_globals so SDL2 has had a chance to register its
+   * output listener before we call it.                                       */
+  for (uint32_t i = 0; i < g_bs.num_outputs && i < MAX_OUTPUTS; i++)
+  {
+    if (g_bs.output_events_pending[i])
+    {
+      g_bs.output_events_pending[i] = 0;
+      _fire_output_events(i);
+    }
+  }
+
+  /* ── deliver pending wl_callback done events ── */
+  for (uint32_t i = 0; i < MAX_CALLBACKS; i++)
+  {
+    if (g_bs.callback_pending[i] && g_callbacks[i].funcs)
+    {
+      g_bs.callback_pending[i] = 0;
+      _fire_callback_done(i);
+    }
+  }
+
+  BRIDGE_BEGIN_WL();
+
+  BRIDGE_CTRL_WL()->opcode = OP_wl_roundtrip;
+  BRIDGE_CTRL_WL()->args_len = 0;
+  BRIDGE_CTRL_WL()->data_offset = 0;
+  BRIDGE_CTRL_WL()->data_size = 0;
+
+  bridge_send_void_wl();
+
+  /* ── fire keyboard focus before delivering events ── */
+  _fire_keyboard_focus();
+
+  uint64_t one = 1;
+  (void)write(g_bs.event_efd, &one, sizeof(one));
+
+  _deliver_input_events();
+}
+
+/* Diagnostic mitigation only: serialize dispatch entry points. This does not
+ * provide genuine Wayland event-queue semantics; recursion supports listener
+ * callbacks that dispatch again during a roundtrip. */
+static pthread_once_t g_dispatch_mutex_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_dispatch_mutex;
+static int g_dispatch_mutex_init_error;
+static int g_wl_profile_enabled;
+
+static uint64_t wl_profile_now_ns(void)
+{
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    return 0;
+  return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+static void initialize_dispatch_mutex(void)
+{
+  const char *profile = getenv("PPSSPP_BRIDGE_PROFILE");
+  g_wl_profile_enabled = profile && strcmp(profile, "1") == 0;
+  pthread_mutexattr_t attr;
+  int error = pthread_mutexattr_init(&attr);
+  if (!error)
+  {
+    error = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    if (!error)
+      error = pthread_mutex_init(&g_dispatch_mutex, &attr);
+    pthread_mutexattr_destroy(&attr);
+  }
+  g_dispatch_mutex_init_error = error;
+}
+
+void _bridge_dispatch(void)
+{
+  int error = pthread_once(&g_dispatch_mutex_once, initialize_dispatch_mutex);
+  if (error || g_dispatch_mutex_init_error)
+  {
+    fprintf(stderr, "[wl_stub] _bridge_dispatch mutex initialization failed (%d)\n",
+            error ? error : g_dispatch_mutex_init_error);
+    return;
+  }
+  uint64_t lock_start_ns = g_wl_profile_enabled ? wl_profile_now_ns() : 0;
+  error = pthread_mutex_lock(&g_dispatch_mutex);
+  if (error)
+  {
+    fprintf(stderr, "[wl_stub] _bridge_dispatch mutex lock failed (%d)\n", error);
+    return;
+  }
+  uint64_t dispatch_start_ns = g_wl_profile_enabled ? wl_profile_now_ns() : 0;
+  uint64_t lock_end_ns = dispatch_start_ns;
+  dispatch_unlocked();
+  if (g_wl_profile_enabled)
+  {
+    uint64_t dispatch_end_ns = wl_profile_now_ns();
+    uint64_t lock_wait_ns = lock_end_ns >= lock_start_ns ? lock_end_ns - lock_start_ns : 0;
+    uint64_t dispatch_ns = dispatch_end_ns >= dispatch_start_ns
+                               ? dispatch_end_ns - dispatch_start_ns
+                               : 0;
+    if (lock_wait_ns > UINT64_C(50000000) || dispatch_ns > UINT64_C(50000000))
+      fprintf(stderr,
+              "[perf-wl-dispatch] {\"mono_ns\":%" PRIu64
+              ",\"lock_wait_ns\":%" PRIu64 ",\"dispatch_ns\":%" PRIu64
+              ",\"tid\":%ld}\n",
+              dispatch_end_ns, lock_wait_ns, dispatch_ns,
+              (long)syscall(SYS_gettid));
+  }
+  error = pthread_mutex_unlock(&g_dispatch_mutex);
+  if (error)
+    fprintf(stderr, "[wl_stub] _bridge_dispatch mutex unlock failed (%d)\n", error);
+}
+
+static void _fire_output_events(uint32_t idx)
+{
+  listener_slot_t *s = &g_bs.outputs[idx];
+  if (!s->funcs && !s->dispatch_fn)
+    return;
+  struct wl_output *out = (struct wl_output *)H2P(BH_OUTPUT_BASE + idx);
+
+  /* index 0: geometry */
+  if (s->funcs && s->funcs[0])
+  {
+    typedef void (*geo_fn)(void *, struct wl_output *, int32_t, int32_t,
+                           int32_t, int32_t, int32_t, const char *,
+                           const char *, int32_t);
+    ((geo_fn)s->funcs[0])(s->data, out, 0, 0, (int32_t)g_bs.output_phys_w,
+                          (int32_t)g_bs.output_phys_h,
+                          WL_OUTPUT_SUBPIXEL_UNKNOWN, "LG", "webOS TV",
+                          WL_OUTPUT_TRANSFORM_NORMAL);
+  }
+
+  /* index 1: mode */
+  if (s->funcs && s->funcs[1])
+  {
+    typedef void (*mode_fn)(void *, struct wl_output *, uint32_t, int32_t,
+                            int32_t, int32_t);
+    ((mode_fn)s->funcs[1])(s->data, out, 3, (int32_t)g_bs.output_width,
+                           (int32_t)g_bs.output_height,
+                           (int32_t)g_bs.output_refresh);
+  }
+
+  /* index 2: scale */
+  if (s->funcs && s->funcs[2])
+  {
+    typedef void (*scale_fn)(void *, struct wl_output *, int32_t);
+    ((scale_fn)s->funcs[2])(s->data, out, (int32_t)g_bs.output_scale);
+  }
+
+  /* index 3: done */
+  if (s->funcs && s->funcs[3])
+  {
+    typedef void (*done_fn)(void *, struct wl_output *);
+    ((done_fn)s->funcs[3])(s->data, out);
+  }
+
+  if (s->dispatch_fn)
+  {
+    union wl_argument geo_args[8];
+    geo_args[0].i = 0;
+    geo_args[1].i = 0;
+    geo_args[2].i = (int32_t)g_bs.output_phys_w;
+    geo_args[3].i = (int32_t)g_bs.output_phys_h;
+    geo_args[4].i = WL_OUTPUT_SUBPIXEL_UNKNOWN;
+    geo_args[5].s = "LG";
+    geo_args[6].s = "webOS TV";
+    geo_args[7].i = WL_OUTPUT_TRANSFORM_NORMAL;
+    s->dispatch_fn(s->dispatch_impl, out, 0, &_msg_output_geometry, geo_args);
+
+    union wl_argument mode_args[4];
+    mode_args[0].u = 3; /* CURRENT | PREFERRED */
+    mode_args[1].i = (int32_t)g_bs.output_width;
+    mode_args[2].i = (int32_t)g_bs.output_height;
+    mode_args[3].i = (int32_t)g_bs.output_refresh;
+    s->dispatch_fn(s->dispatch_impl, out, 1, &_msg_output_mode, mode_args);
+
+    union wl_argument done_args[1];
+    memset(done_args, 0, sizeof(done_args));
+    s->dispatch_fn(s->dispatch_impl, out, 2, &_msg_output_done, done_args);
+
+    union wl_argument scale_args[1];
+    scale_args[0].i = (int32_t)g_bs.output_scale;
+    s->dispatch_fn(s->dispatch_impl, out, 3, &_msg_output_scale, scale_args);
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * wl_display
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+struct wl_display *wl_display_connect(const char *name)
+{
+#ifdef DEBUG_WAYLAND
+  log_console("wl_display_connect() name = %s", name);
+  log_console("pre-reset: event_efd=%d next_surface=%u id_watermark=%u",
+              g_bs.event_efd, g_bs.next_surface, g_bs.id_watermark);
+#endif
+
+  BRIDGE_BEGIN_WL();
+
+  if (g_bs.event_efd > 0)
+    close(g_bs.event_efd);
+  memset(&g_bs, 0, sizeof(g_bs));
+  g_bs.next_surface = BH_SURFACE_BASE;
+  g_bs.event_efd = eventfd(0, EFD_NONBLOCK);
+
+#ifdef DEBUG_WAYLAND
+  log_console("post-reset: event_efd=%d", g_bs.event_efd);
+#endif
+
+  BridgeCtrl *C = BRIDGE_CTRL_WL();
+  C->opcode = OP_wl_display_connect;
+  C->args_len = 0;
+  C->data_offset = 0;
+  C->data_size = 0;
+
+  uint32_t slot = (uint32_t)bridge_send_call_wl();
+
+  if (!slot)
+  {
+    log_error("wl_display_connect: proxy FAILED");
+    return NULL;
+  }
+
+  const uint32_t *rb = (const uint32_t *)C->result_buf;
+  g_bs.num_seats = rb[1] ? rb[1] : 1;
+  g_bs.num_outputs = rb[2] ? rb[2] : 1;
+  g_bs.id_watermark = rb[3];
+
+  /* webos_seat info */
+  g_bs.webos_seat_received = rb[4];
+  g_bs.webos_seat_id = rb[5];
+  g_bs.webos_seat_designator = rb[6];
+  g_bs.webos_seat_capabilities = rb[7];
+
+  g_bs.output_width = rb[8];
+  g_bs.output_height = rb[9];
+  g_bs.output_refresh = rb[10];
+  g_bs.output_phys_w = rb[11];
+  g_bs.output_phys_h = rb[12];
+  g_bs.output_scale = rb[13];
+
+#ifdef DEBUG_WAYLAND
+  log_console(
+      "wl_display_connect: output_width=%d output_height=%d output_refresh=%d",
+      g_bs.output_width, g_bs.output_height, g_bs.output_refresh);
+#endif
+
+  strncpy(g_bs.webos_seat_name, (const char *)&rb[14],
+          sizeof(g_bs.webos_seat_name) - 1);
+
+#ifdef DEBUG_WAYLAND
+  log_console("wl_display_connect: webos_seat received=%u name='%s'",
+              g_bs.webos_seat_received, g_bs.webos_seat_name);
+#endif
+  g_bridge_displays[slot].magic = BRIDGE_MAGIC;
+  g_bridge_displays[slot].slot = slot;
+  g_active_bridge_displays++;
+
+#ifdef DEBUG_WAYLAND
+  log_console("connected: num_seats=%u num_outputs=%u id_watermark=%u disp "
+              "slot=%u g_active_bridge_displays=%d",
+              g_bs.num_seats, g_bs.num_outputs, g_bs.id_watermark, slot,
+              g_active_bridge_displays);
+#endif
+
+  /* fetch keymap so it is now ready for _fire_keyboard_focus_to. */
+  _fetch_proxy_keymap();
+
+  return (struct wl_display *)&g_bridge_displays[slot];
+}
+
+void wl_display_disconnect(struct wl_display *dpy)
+{
+  if (!IS_BRIDGE_DPY(dpy))
+  {
+    log_error("wl_display_disconnect() - calling REAL disconnect");
+    REAL(wl_display_disconnect)(dpy);
+    return;
+  }
+  BridgeDisplay *bd = (BridgeDisplay *)dpy;
+  uint32_t slot = bd->slot;
+
+#ifdef DEBUG_WAYLAND
+  log_console("wl_display_disconnect() %p fd=%d disp slot=%d", dpy,
+              wl_display_get_fd(dpy), slot);
+#endif
+
+  BRIDGE_BEGIN_WL();
+  BridgeCtrl *C = BRIDGE_CTRL_WL();
+  C->opcode = OP_wl_display_disconnect;
+
+  ArgWriter W = aw_init(C->args, BRIDGE_ARGS_SIZE);
+  aw_u32(&W, slot);
+  C->args_len = W.pos;
+
+  C->data_offset = 0;
+  C->data_size = 0;
+  C->data2_offset = 0;
+  C->data2_size = 0;
+
+  bridge_send_call_wl();
+
+  /* Only close the shared event fd when the LAST active bridge display
+   * disconnects.  Closing it prematurely kills wl_display_get_fd() for
+   * every other active display (they all share g_bs.event_efd). */
+  if (--g_active_bridge_displays <= 0)
+  {
+    close(g_bs.event_efd);
+    g_bs.event_efd = -1;
+    g_active_bridge_displays = 0;
+    if (g_bs.event_efd > 0)
+    {
+      close(g_bs.event_efd);
+      g_bs.event_efd = -1;
+    }
+  }
+}
+
+int wl_display_get_fd(struct wl_display *dpy)
+{
+  if (!IS_BRIDGE_DPY(dpy))
+    return REAL(wl_display_get_fd)(dpy);
+  return g_bs.event_efd;
+}
+
+int wl_display_dispatch(struct wl_display *dpy)
+{
+  BridgeDisplay *bd = (BridgeDisplay *)dpy;
+  uint32_t slot = -1;
+
+  if (bd)
+    slot = bd->slot;
+
+#ifdef DEBUG_WAYLAND
+  log_console("wl_display_dispatch() dpy: %p fd=%d disp slot=%d", dpy,
+              wl_display_get_fd(dpy), slot);
+#endif
+
+  if (!IS_BRIDGE_DPY(dpy))
+    return REAL(wl_display_dispatch)(dpy);
+  _bridge_dispatch();
+  return 0;
+}
+
+int wl_display_dispatch_pending(struct wl_display *dpy)
+{
+  if (!IS_BRIDGE_DPY(dpy))
+    return REAL(wl_display_dispatch_pending)(dpy);
+  _bridge_dispatch();
+  return 0;
+}
+
+int wl_display_dispatch_queue(struct wl_display *dpy, struct wl_event_queue *q)
+{
+  if (!IS_BRIDGE_DPY(dpy))
+    return REAL(wl_display_dispatch_queue)(dpy, q);
+  _bridge_dispatch();
+  return 0;
+}
+
+int wl_display_dispatch_queue_pending(struct wl_display *dpy,
+                                      struct wl_event_queue *q)
+{
+  if (!IS_BRIDGE_DPY(dpy))
+    return REAL(wl_display_dispatch_queue_pending)(dpy, q);
+  _bridge_dispatch();
+  return 0;
+}
+
+int wl_display_roundtrip(struct wl_display *dpy)
+{
+  if (!IS_BRIDGE_DPY(dpy))
+    return REAL(wl_display_roundtrip)(dpy);
+  _bridge_dispatch();
+  return 0;
+}
+
+int wl_display_flush(struct wl_display *dpy)
+{
+  if (!IS_BRIDGE_DPY(dpy))
+    return REAL(wl_display_flush)(dpy);
+  BRIDGE_BEGIN_WL();
+  BRIDGE_CTRL_WL()->opcode = OP_wl_flush;
+  BRIDGE_CTRL_WL()->args_len = 0;
+  bridge_send_void_wl();
+  return 0;
+}
+
+int wl_display_prepare_read(struct wl_display *dpy)
+{
+  if (!IS_BRIDGE_DPY(dpy))
+    return REAL(wl_display_prepare_read)(dpy);
+  return 0;
+}
+
+int wl_display_prepare_read_queue(struct wl_display *dpy,
+                                  struct wl_event_queue *q)
+{
+  if (!IS_BRIDGE_DPY(dpy))
+    return REAL(wl_display_prepare_read_queue)(dpy, q);
+  return 0;
+}
+
+void wl_display_cancel_read(struct wl_display *dpy)
+{
+  if (!IS_BRIDGE_DPY(dpy))
+    REAL(wl_display_cancel_read)(dpy);
+}
+
+int wl_display_read_events(struct wl_display *dpy)
+{
+  if (!IS_BRIDGE_DPY(dpy))
+    return REAL(wl_display_read_events)(dpy);
+  _bridge_dispatch();
+  return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * wl_proxy
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+uint32_t wl_proxy_get_version(struct wl_proxy *proxy)
+{
+  if (!IS_BRIDGE_PROXY(proxy))
+    return REAL(wl_proxy_get_version)(proxy);
+  return 4;
+}
+
+/*
+ * wl_proxy_get_id — called by egl_stub to get the surface "wire ID" which
+ * we repurpose as the proxy slot index.  With the slot map, each surface
+ * handle returns the correct proxy slot rather than always returning the
+ * last-created slot.
+ */
+uint32_t wl_proxy_get_id(struct wl_proxy *proxy)
+{
+  if (!IS_BRIDGE_PROXY(proxy))
+    return REAL(wl_proxy_get_id)(proxy);
+  if (IS_BRIDGE_DPY(proxy))
+    return 1;
+
+  uint32_t h = resolve_handle(P2H(proxy));
+
+  /* Watermark probes from egl_stub (wl_display_sync returns BH_DUMMY_SYNC) */
+  if (h >= 0xF0)
+    return g_bs.id_watermark;
+
+  /* Surface handles — return the specific proxy slot for this surface */
+  if (h >= BH_SURFACE_BASE && h < BH_SHELL_SURF_BASE)
+  {
+#ifdef DEBUG_WAYLAND
+    log_console("wl_proxy_get_id - slot_for_surface - h=%d slot=%d", h,
+                slot_for_surface(h));
+#endif
+    return slot_for_surface(h);
+  }
+
+  // return g_bs.surface_proxy_slot;
+  //  wont work for proxy owns EGL/WL as retroarch
+  //  egl_create_surface(native_window=0x103e64c0) is new
+#ifdef DEBUG_WAYLAND
+  log_console("wl_proxy_get_id - slot_for_surface - h=%d returning 0", h);
+#endif
+
+  return 0;
+}
+
+void wl_proxy_destroy(struct wl_proxy *proxy)
+{
+  if (!IS_BRIDGE_PROXY(proxy))
+  {
+    REAL(wl_proxy_destroy)(proxy);
+    return;
+  }
+
+  uint32_t h = resolve_handle(P2H(proxy));
+
+#ifdef DEBUG_WAYLAND
+  log_console("wl_proxy_destroy h=%u proxy=%p", h, proxy);
+#endif
+
+  if (h == BH_REGISTRY)
+  {
+    g_bs.reg_listener = NULL;
+    g_bs.reg_listener_data = NULL;
+    g_bs.reg_dispatch_fn = NULL;
+    g_bs.reg_dispatch_impl = NULL;
+    g_bs.reg_dispatch_data = NULL;
+    g_bs.globals_fired = 0;
+  }
+  else if (h >= BH_SEAT_BASE && h < BH_SEAT_BASE + MAX_SEATS)
+  {
+    uint32_t idx = h - BH_SEAT_BASE;
+    memset(&g_bs.seats[idx], 0, sizeof(g_bs.seats[idx]));
+  }
+  else if (h >= BH_OUTPUT_BASE && h < BH_OUTPUT_BASE + MAX_OUTPUTS)
+  {
+    uint32_t idx = h - BH_OUTPUT_BASE;
+    memset(&g_bs.outputs[idx], 0, sizeof(g_bs.outputs[idx]));
+    g_bs.output_events_pending[idx] = 0;
+  }
+  else if (h >= BH_KEYBOARD_BASE && h < BH_KEYBOARD_BASE + MAX_SEATS)
+  {
+    uint32_t idx = h - BH_KEYBOARD_BASE;
+    memset(&g_bs.keyboards[idx], 0, sizeof(g_bs.keyboards[idx]));
+  }
+  else if (h >= BH_POINTER_BASE && h < BH_POINTER_BASE + MAX_SEATS)
+  {
+    uint32_t idx = h - BH_POINTER_BASE;
+    memset(&g_bs.pointers[idx], 0, sizeof(g_bs.pointers[idx]));
+  }
+  else if (h >= BH_WEBOS_SURF_BASE && h < BH_WEBOS_SURF_BASE + 100)
+  {
+    uint32_t idx = h - BH_WEBOS_SURF_BASE;
+    g_bs.webos_ss_listener = NULL;
+    g_bs.webos_ss_listener_data = NULL;
+    g_bs.webos_ss_dispatch_fn = NULL;
+    g_bs.webos_ss_dispatch_impl = NULL;
+    g_bs.webos_ss_dispatch_data = NULL;
+    if (idx < SURF_MAP_MAX)
+    {
+      g_bs.webos_ss_listeners[idx] = NULL;
+      g_bs.webos_ss_listener_data_arr[idx] = NULL;
+      g_bs.webos_ss_dispatch_fn_arr[idx] = NULL;
+      g_bs.webos_ss_dispatch_impl_arr[idx] = NULL;
+      g_bs.webos_ss_dispatch_data_arr[idx] = NULL;
+    }
+  }
+  else if (h >= BH_SURFACE_BASE && h < BH_SHELL_SURF_BASE)
+  {
+    uint32_t slot = slot_for_surface(h);
+    if (slot)
+    {
+      BRIDGE_BEGIN_WL();
+      BridgeCtrl *C = BRIDGE_CTRL_WL();
+      C->opcode = OP_wl_surface_destroy;
+      ArgWriter W = aw_init(C->args, BRIDGE_ARGS_SIZE);
+      aw_u32(&W, slot);
+      C->args_len = W.pos;
+      C->data_offset = 0;
+      C->data_size = 0;
+      bridge_send_void_wl();
+    }
+  }
+  else if ((h >= BH_SHELL_SURF_BASE && h < BH_WEBOS_SURF_BASE) ||
+           (h >= BH_WEBOS_SURF_BASE && h < BH_WEBOS_SURF_BASE + 100))
+  {
+    uint32_t slot = (h >= BH_WEBOS_SURF_BASE) ? slot_for_webosurf(h)
+                                              : slot_for_shellsurf(h);
+    if (slot)
+    {
+      BRIDGE_BEGIN_WL();
+      BridgeCtrl *C = BRIDGE_CTRL_WL();
+      C->opcode = OP_wl_proxy_destroy;
+      ArgWriter W = aw_init(C->args, BRIDGE_ARGS_SIZE);
+      aw_u32(&W, slot);
+      C->args_len = W.pos;
+      C->data_offset = 0;
+      C->data_size = 0;
+      bridge_send_void_wl();
+    }
+    /* fall through to existing local g_bs cleanup for h >= BH_WEBOS_SURF_BASE
+     */
+  }
+  else if (h >= BH_WEBOS_SEAT_BASE && h < BH_WEBOS_SEAT_BASE + MAX_SEATS)
+  {
+    uint32_t idx = h - BH_WEBOS_SEAT_BASE;
+    memset(&g_bs.webos_seat_listeners[idx], 0,
+           sizeof(g_bs.webos_seat_listeners[idx]));
+    g_bs.webos_seat_info_fired[idx] = 0;
+  }
+  else if (is_callback_handle(h))
+  {
+    uint32_t idx = h - BH_CALLBACK_BASE;
+    g_callbacks[idx].funcs = NULL;
+    g_callbacks[idx].data = NULL;
+    g_callbacks[idx].pending = 0;
+    g_callbacks[idx].dispatch_fn = NULL;
+    g_callbacks[idx].dispatch_impl = NULL;
+    g_callbacks[idx].dispatch_data = NULL;
+  }
+
+  if (h < MAX_PROXY_USERDATA)
+    g_proxy_userdata[h] = NULL;
+  if (h < MAX_PROXY_TAGS)
+    g_proxy_tags[h] = NULL;
+}
+
+int wl_proxy_add_listener(struct wl_proxy *proxy, void (**impl)(void),
+                          void *data)
+{
+#ifdef DEBUG_WAYLAND
+  log_console("wl_proxy_add_listener h=%u proxy=%p data=%p", P2H(proxy), proxy,
+              data);
+#endif
+
+  if (!IS_BRIDGE_PROXY(proxy))
+    return REAL(wl_proxy_add_listener)(proxy, impl, data);
+
+  uint32_t h = resolve_handle(P2H(proxy));
+
+  if (h == BH_REGISTRY)
+  {
+#ifdef DEBUG_WAYLAND
+    log_console("wl_proxy_add_listener BH_REGISTRY h=%u proxy=%p data=%p", h,
+                proxy, data);
+#endif
+    g_bs.reg_listener = (const struct wl_registry_listener *)impl;
+    g_bs.reg_listener_data = data;
+    return 0;
+  }
+  if (h >= BH_SEAT_BASE && h < BH_SEAT_BASE + MAX_SEATS)
+  {
+    uint32_t idx = h - BH_SEAT_BASE;
+#ifdef DEBUG_WAYLAND
+    log_console("wl_proxy_add_listener BH_SEAT h=%u idx=%u proxy=%p data=%p", h,
+                idx, proxy, data);
+#endif
+    g_bs.seats[idx].funcs = impl;
+    g_bs.seats[idx].data = data;
+    _fire_seat_capabilities(idx);
+    return 0;
+  }
+  if (h >= BH_OUTPUT_BASE && h < BH_OUTPUT_BASE + MAX_OUTPUTS)
+  {
+    uint32_t idx = h - BH_OUTPUT_BASE;
+#ifdef DEBUG_WAYLAND
+    log_console("wl_proxy_add_listener BH_OUTPUT h=%u idx=%u proxy=%p data=%p",
+                h, idx, proxy, data);
+#endif
+    g_bs.outputs[idx].funcs = impl;
+    g_bs.outputs[idx].data = data;
+    /* Don't fire output events inline (we may be inside a global callback).
+     * Mark as pending so they fire on the next dispatch/roundtrip call.  */
+    g_bs.output_events_pending[idx] = 1;
+    return 0;
+  }
+  if (h >= BH_WEBOS_SURF_BASE && h < BH_WEBOS_SURF_BASE + 100)
+  {
+    uint32_t idx = h - BH_WEBOS_SURF_BASE;
+#ifdef DEBUG_WAYLAND
+    log_console(
+        "wl_proxy_add_listener BH_WEBOS_SURF h=%u idx=%u proxy=%p data=%p", h,
+        idx, proxy, data);
+#endif
+    /* Store both globally (legacy) and per-surface */
+    g_bs.webos_ss_listener = impl;
+    g_bs.webos_ss_listener_data = data;
+    if (idx < SURF_MAP_MAX)
+    {
+      g_bs.webos_ss_listeners[idx] = impl;
+      g_bs.webos_ss_listener_data_arr[idx] = data;
+    }
+    return 0;
+  }
+  if (h >= BH_KEYBOARD_BASE && h < BH_KEYBOARD_BASE + MAX_SEATS)
+  {
+    uint32_t idx = h - BH_KEYBOARD_BASE;
+#ifdef DEBUG_WAYLAND
+    log_console(
+        "wl_proxy_add_listener BH_KEYBOARD h=%u idx=%u proxy=%p data=%p", h,
+        idx, proxy, data);
+#endif
+    g_bs.keyboards[idx].funcs = impl;
+    g_bs.keyboards[idx].data = data;
+    return 0;
+  }
+  if (h >= BH_POINTER_BASE && h < BH_POINTER_BASE + MAX_SEATS)
+  {
+    uint32_t idx = h - BH_POINTER_BASE;
+#ifdef DEBUG_WAYLAND
+    log_console("wl_proxy_add_listener BH_POINTER h=%u idx=%u proxy=%p data=%p",
+                h, idx, proxy, data);
+#endif
+    g_bs.pointers[idx].funcs = impl;
+    g_bs.pointers[idx].data = data;
+    return 0;
+  }
+
+  /* starfish / foreign / dummy objects: accept listener silently */
+  if (h == BH_STARFISH_POINTER || h == BH_STARFISH_OUTPUT ||
+      h == BH_WEBOS_FOREIGN || h == BH_DUMMY)
+  {
+#ifdef DEBUG_WAYLAND
+    log_console(
+        "wl_proxy_add_listener BH_STARFISH_POINTER/OUTPUT/FOREIGN/DUMMY h=%u "
+        "proxy=%p data=%p",
+        h, proxy, data);
+#endif
+    return 0;
+  }
+
+  /* wl_callback */
+  if (is_callback_handle(h))
+  {
+    uint32_t idx = h - BH_CALLBACK_BASE;
+    g_callbacks[idx].funcs = impl;
+    g_callbacks[idx].data = data;
+    g_bs.callback_pending[idx] = 1;
+    return 0;
+  }
+
+  if (h >= BH_WEBOS_SEAT_BASE && h < BH_WEBOS_SEAT_BASE + MAX_SEATS)
+  {
+    uint32_t idx = h - BH_WEBOS_SEAT_BASE;
+#ifdef DEBUG_WAYLAND
+    log_console(
+        "wl_proxy_add_listener BH_WEBOS_SEAT h=%u idx=%u proxy=%p data=%p", h,
+        idx, proxy, data);
+#endif
+    g_bs.webos_seat_listeners[idx].funcs = impl;
+    g_bs.webos_seat_listeners[idx].data = data;
+    /* Fire info immediately if we have it */
+    if (g_bs.webos_seat_received && !g_bs.webos_seat_info_fired[idx])
+    {
+      g_bs.webos_seat_info_fired[idx] = 1;
+      typedef void (*info_fn)(void *, struct wl_webos_seat *, uint32_t,
+                              const char *, uint32_t, uint32_t);
+      if (impl[0])
+        ((info_fn)impl[0])(
+            data, (struct wl_webos_seat *)H2P(BH_WEBOS_SEAT_BASE + idx),
+            g_bs.webos_seat_id, g_bs.webos_seat_name,
+            g_bs.webos_seat_designator, g_bs.webos_seat_capabilities);
+    }
+    return 0;
+  }
+
+  return 0;
+}
+
+int wl_proxy_add_dispatcher(struct wl_proxy *proxy,
+                            wl_dispatcher_func_t dispatcher_func,
+                            const void *dispatcher_data, void *data)
+{
+#ifdef DEBUG_WAYLAND
+  log_console("wl_proxy_add_dispatcher h=%u proxy=%p dispatcher_data=%p "
+              "data=%p is bridge=%s",
+              P2H(proxy), proxy, dispatcher_data, data,
+              IS_BRIDGE_PROXY(proxy) ? "BRIDGE" : "REAL");
+#endif
+
+  if (!IS_BRIDGE_PROXY(proxy))
+    return REAL(wl_proxy_add_dispatcher)(proxy, dispatcher_func,
+                                         dispatcher_data, data);
+
+  uint32_t h = resolve_handle(P2H(proxy));
+
+  if (h == BH_REGISTRY)
+  {
+    /* reset globals_fired when a NEW registry instance registers its
+     * dispatcher */
+    if (dispatcher_data != g_bs.reg_dispatch_impl)
+    {
+#ifdef DEBUG_WAYLAND
+      log_console("wl_proxy_add_dispatcher: registry dispatcher changed "
+                  "from %p to %p",
+                  g_bs.reg_dispatch_fn, dispatcher_func);
+#endif
+      log_console("wl_proxy_add_dispatcher: registry impl changed %p -> %p, "
+                  "resetting globals_fired",
+                  g_bs.reg_dispatch_impl, dispatcher_data);
+      g_bs.globals_fired = 0;
+    }
+
+    g_bs.reg_dispatch_fn = dispatcher_func;
+    g_bs.reg_dispatch_impl = dispatcher_data;
+    g_bs.reg_dispatch_data = data;
+    return 0;
+  }
+
+  if (h >= BH_SEAT_BASE && h < BH_SEAT_BASE + MAX_SEATS)
+  {
+#ifdef DEBUG_WAYLAND
+    log_console("wl_proxy_add_dispatcher BH_SEAT h=%u idx=%u proxy=%p "
+                "dispatcher_data=%p data=%p",
+                h, h - BH_SEAT_BASE, proxy, dispatcher_data, data);
+#endif
+    uint32_t idx = h - BH_SEAT_BASE;
+    g_bs.seats[idx].dispatch_fn = dispatcher_func;
+    g_bs.seats[idx].dispatch_impl = dispatcher_data;
+    g_bs.seats[idx].dispatch_data = data;
+    /* deferring by one _bridge_dispatch cycle gives kodi time to set the
+     * handler. */
+    g_bs.seat_caps_pending[idx] = 1;
+    return 0;
+  }
+
+  if (h >= BH_OUTPUT_BASE && h < BH_OUTPUT_BASE + MAX_OUTPUTS)
+  {
+    uint32_t idx = h - BH_OUTPUT_BASE;
+    g_bs.outputs[idx].dispatch_fn = dispatcher_func;
+    g_bs.outputs[idx].dispatch_impl = dispatcher_data;
+    g_bs.outputs[idx].dispatch_data = data;
+    g_bs.output_events_pending[idx] = 1;
+    return 0;
+  }
+
+  if (h >= BH_WEBOS_SURF_BASE && h < BH_WEBOS_SURF_BASE + 100)
+  {
+    uint32_t idx = h - BH_WEBOS_SURF_BASE;
+    g_bs.webos_ss_dispatch_fn = dispatcher_func;
+    g_bs.webos_ss_dispatch_impl = dispatcher_data;
+    g_bs.webos_ss_dispatch_data = data;
+    if (idx < SURF_MAP_MAX)
+    {
+      g_bs.webos_ss_dispatch_fn_arr[idx] = dispatcher_func;
+      g_bs.webos_ss_dispatch_impl_arr[idx] = dispatcher_data;
+      g_bs.webos_ss_dispatch_data_arr[idx] = data;
+    }
+    return 0;
+  }
+
+  if (h >= BH_KEYBOARD_BASE && h < BH_KEYBOARD_BASE + MAX_SEATS)
+  {
+#ifdef DEBUG_WAYLAND
+    log_console("wl_proxy_add_dispatcher BH_KEYBOARD h=%u idx=%u proxy=%p "
+                "dispatcher_data=%p data=%p",
+                h, h - BH_KEYBOARD_BASE, proxy, dispatcher_data, data);
+#endif
+    uint32_t idx = h - BH_KEYBOARD_BASE;
+    g_bs.keyboards[idx].dispatch_fn = dispatcher_func;
+    g_bs.keyboards[idx].dispatch_impl = dispatcher_data;
+    g_bs.keyboards[idx].dispatch_data = data;
+    return 0;
+  }
+
+  if (h >= BH_POINTER_BASE && h < BH_POINTER_BASE + MAX_SEATS)
+  {
+    uint32_t idx = h - BH_POINTER_BASE;
+    g_bs.pointers[idx].dispatch_fn = dispatcher_func;
+    g_bs.pointers[idx].dispatch_impl = dispatcher_data;
+    g_bs.pointers[idx].dispatch_data = data;
+    return 0;
+  }
+
+  if (h == BH_STARFISH_POINTER || h == BH_STARFISH_OUTPUT ||
+      h == BH_WEBOS_FOREIGN || h == BH_DUMMY)
+    return 0;
+
+  if (is_callback_handle(h))
+  {
+    uint32_t idx = h - BH_CALLBACK_BASE;
+    g_callbacks[idx].dispatch_fn = dispatcher_func;
+    g_callbacks[idx].dispatch_impl = dispatcher_data;
+    g_callbacks[idx].dispatch_data = data;
+    g_bs.callback_pending[idx] = 1;
+    return 0;
+  }
+
+  if (h >= BH_WEBOS_SEAT_BASE && h < BH_WEBOS_SEAT_BASE + MAX_SEATS)
+  {
+#ifdef DEBUG_WAYLAND
+    log_console("wl_proxy_add_dispatcher BH_WEBOS_SEAT h=%u idx=%u proxy=%p "
+                "dispatcher_data=%p data=%p",
+                h, h - BH_WEBOS_SEAT_BASE, proxy, dispatcher_data, data);
+#endif
+    uint32_t idx = h - BH_WEBOS_SEAT_BASE;
+    g_bs.webos_seat_listeners[idx].dispatch_fn = dispatcher_func;
+    g_bs.webos_seat_listeners[idx].dispatch_impl = dispatcher_data;
+    g_bs.webos_seat_listeners[idx].dispatch_data = data;
+    if (g_bs.webos_seat_received && !g_bs.webos_seat_info_fired[idx])
+    {
+      g_bs.webos_seat_info_fired[idx] = 1;
+      static const struct wl_message _msg_webos_seat_info = {"info", "usuu",
+                                                             NULL};
+      union wl_argument args[4];
+      args[0].u = g_bs.webos_seat_id;
+      args[1].s = g_bs.webos_seat_name;
+      args[2].u = g_bs.webos_seat_designator;
+      args[3].u = g_bs.webos_seat_capabilities;
+      dispatcher_func(dispatcher_data, (void *)H2P(BH_WEBOS_SEAT_BASE + idx), 0,
+                      &_msg_webos_seat_info, args);
+    }
+    return 0;
+  }
+
+  return 0;
+}
+
+/*
+ * wl_proxy_marshal_flags — intercepts all generated protocol helpers.
+ */
+struct wl_proxy *wl_proxy_marshal_flags(struct wl_proxy *proxy, uint32_t opcode,
+                                        const struct wl_interface *interface,
+                                        uint32_t version, uint32_t flags, ...)
+{
+#ifdef DEBUG_WAYLAND_VERBOSE
+  log_console("wl_proxy_marshal_flags h=%u proxy=%p opcode=%u interface=%p "
+              "version=%u flags=%u",
+              P2H(proxy), proxy, opcode, interface ? interface->name : NULL,
+              version, flags);
+#endif
+
+  if (!IS_BRIDGE_PROXY(proxy))
+    return REAL(wl_proxy_marshal_flags)(proxy, opcode, interface, version,
+                                        flags);
+
+  va_list ap;
+  va_start(ap, flags);
+
+  /* ── Display-level constructors ─────────────────────────────────────── */
+  if (IS_BRIDGE_DPY(proxy))
+  {
+    struct wl_proxy *ret = (struct wl_proxy *)H2P(BH_DUMMY_SYNC);
+    if (interface && !strcmp(interface->name, "wl_registry"))
+    {
+      ret = (struct wl_proxy *)H2P(BH_REGISTRY);
+      g_bs.globals_fired =
+          0; /* a new registry object needs its own global stream */
+    }
+    else if (interface && !strcmp(interface->name, "wl_callback"))
+    {
+      uint32_t idx = alloc_callback();
+      g_callbacks[idx].pending = 1;
+      ret = (struct wl_proxy *)H2P(BH_CALLBACK_BASE + idx);
+    }
+    va_end(ap);
+    return ret;
+  }
+
+  uint32_t h = resolve_handle(P2H(proxy));
+
+  /* ── Registry bind ─────────────────────────────────────────────────── */
+  if (h == BH_REGISTRY)
+  {
+    struct wl_proxy *ret = (struct wl_proxy *)H2P(BH_DUMMY);
+    if (interface)
+    {
+      const char *n = interface->name;
+      if (!strcmp(n, "wl_compositor"))
+        ret = (struct wl_proxy *)H2P(BH_COMPOSITOR);
+      else if (!strcmp(n, "wl_shell"))
+        ret = (struct wl_proxy *)H2P(BH_SHELL);
+      else if (!strcmp(n, "wl_webos_shell"))
+        ret = (struct wl_proxy *)H2P(BH_WEBOS_SHELL);
+      else if (!strcmp(n, "wl_shm"))
+        ret = (struct wl_proxy *)H2P(BH_SHM);
+      else if (!strcmp(n, "wl_seat"))
+      {
+#ifdef DEBUG_WAYLAND
+        log_console("wl_proxy_marshal_flags: seat bind h=%u seat_cnt=%u", h,
+                    g_bs.seat_cnt);
+#endif
+        uint32_t idx = g_bs.seat_cnt++ & (MAX_SEATS - 1);
+        ret = (struct wl_proxy *)H2P(BH_SEAT_BASE + idx);
+      }
+      else if (!strcmp(n, "wl_output"))
+      {
+        uint32_t idx = g_bs.out_cnt++ & (MAX_OUTPUTS - 1);
+        ret = (struct wl_proxy *)H2P(BH_OUTPUT_BASE + idx);
+      }
+      else if (!strcmp(n, "wl_webos_input_manager"))
+        ret = (struct wl_proxy *)H2P(BH_WEBOS_INPUT_MGR);
+      else if (!strcmp(n, "wl_starfish_pointer"))
+        ret = (struct wl_proxy *)H2P(BH_STARFISH_POINTER);
+      else if (!strcmp(n, "wl_starfish_output"))
+        ret = (struct wl_proxy *)H2P(BH_STARFISH_OUTPUT);
+      else if (!strcmp(n, "wl_webos_foreign"))
+        ret = (struct wl_proxy *)H2P(BH_WEBOS_FOREIGN);
+    }
+    va_end(ap);
+    return ret;
+  }
+
+  /* ── wl_compositor::create_surface ─────────────────────────────────── */
+  if (h == BH_COMPOSITOR && interface && !strcmp(interface->name, "wl_surface"))
+  {
+    va_end(ap);
+    BRIDGE_BEGIN_WL();
+    BridgeCtrl *C = BRIDGE_CTRL_WL();
+    C->opcode = OP_wl_compositor_create_surface;
+    C->args_len = 0;
+    C->data_offset = 0;
+    C->data_size = 0;
+    uint32_t surf_slot = (uint32_t)bridge_send_call_wl();
+
+    /* Record this slot for the specific surface handle */
+    uint32_t surf_h = g_bs.next_surface++;
+    uint32_t idx = surf_h - BH_SURFACE_BASE;
+    if (idx < SURF_MAP_MAX)
+      g_bs.surface_slot_map[idx] = surf_slot;
+    g_bs.surface_proxy_slot = surf_slot; /* legacy: keep last slot */
+
+#ifdef DEBUG_WAYLAND
+    log_console("stub=%u idx=%u surf_slot=%u map[%u]=%u", surf_h, idx,
+                surf_slot, idx, g_bs.surface_slot_map[idx]);
+#endif
+
+    return (struct wl_proxy *)H2P(surf_h);
+  }
+
+  /* ── wl_shell::get_shell_surface ────────────────────────────────────── */
+  if (h == BH_SHELL && interface &&
+      !strcmp(interface->name, "wl_shell_surface"))
+  {
+    (void)va_arg(ap, struct wl_proxy *); /* NULL new-id placeholder */
+    struct wl_proxy *surf = va_arg(ap, struct wl_proxy *);
+    va_end(ap);
+    uint32_t slot = slot_for_surface(P2H(surf));
+    assert(slot != 0);
+    BRIDGE_BEGIN_WL();
+    BridgeCtrl *C = BRIDGE_CTRL_WL();
+    C->opcode = OP_wl_shell_get_shell_surface;
+    ArgWriter W = aw_init(C->args, BRIDGE_ARGS_SIZE);
+    aw_u32(&W, slot);
+    C->args_len = W.pos;
+    C->data_offset = 0;
+    C->data_size = 0;
+    bridge_send_call_wl();
+    return (struct wl_proxy *)H2P(BH_SHELL_SURF_BASE +
+                                  (P2H(surf) - BH_SURFACE_BASE));
+  }
+
+  /* ── wl_webos_shell::get_shell_surface (opcode 1) ───────────────────── */
+  if (h == BH_WEBOS_SHELL && opcode == 1 && interface &&
+      !strcmp(interface->name, "wl_webos_shell_surface"))
+  {
+    (void)va_arg(ap, struct wl_proxy *); /* NULL new-id placeholder */
+    struct wl_proxy *surf = va_arg(ap, struct wl_proxy *);
+    va_end(ap);
+    uint32_t slot = slot_for_surface(P2H(surf));
+    assert(slot != 0);
+    BRIDGE_BEGIN_WL();
+    BridgeCtrl *C = BRIDGE_CTRL_WL();
+    C->opcode = OP_wl_webos_shell_get_shell_surface;
+    ArgWriter W = aw_init(C->args, BRIDGE_ARGS_SIZE);
+    aw_u32(&W, slot);
+    C->args_len = W.pos;
+    C->data_offset = 0;
+    C->data_size = 0;
+    bridge_send_call_wl();
+    return (struct wl_proxy *)H2P(BH_WEBOS_SURF_BASE +
+                                  (P2H(surf) - BH_SURFACE_BASE));
+  }
+
+  /* ── wl_shell_surface::set_toplevel (opcode 3) ──────────────────────── */
+  if (h >= BH_SHELL_SURF_BASE && h < BH_WEBOS_SURF_BASE && opcode == 3 &&
+      !interface)
+  {
+    va_end(ap);
+    uint32_t slot = slot_for_shellsurf(h);
+    assert(slot != 0);
+    BRIDGE_BEGIN_WL();
+    BridgeCtrl *C = BRIDGE_CTRL_WL();
+    C->opcode = OP_wl_shell_surface_set_toplevel;
+    ArgWriter W = aw_init(C->args, BRIDGE_ARGS_SIZE);
+    aw_u32(&W, slot);
+    C->args_len = W.pos;
+    C->data_offset = 0;
+    C->data_size = 0;
+    bridge_send_void_wl();
+    return NULL;
+  }
+
+  /* ── wl_webos_shell_surface::set_state (opcode 1) ──────────────────────
+   * Called by client when going fullscreen/windowed. */
+  if (h >= BH_WEBOS_SURF_BASE && h < BH_WEBOS_SURF_BASE + 100 && opcode == 1 &&
+      !interface)
+  {
+    uint32_t state = va_arg(ap, uint32_t);
+    va_end(ap);
+    uint32_t slot = slot_for_webosurf(h);
+
+#ifdef DEBUG_WAYLAND
+    log_console("wl_proxy_marshal_flags - OP_wl_webos_shell_surface_set_state "
+                "- state=%d slot=%d",
+                state, slot);
+#endif
+    if (slot)
+    {
+      BRIDGE_BEGIN_WL();
+      BridgeCtrl *C = BRIDGE_CTRL_WL();
+      C->opcode = OP_wl_webos_shell_surface_set_state;
+      ArgWriter W = aw_init(C->args, BRIDGE_ARGS_SIZE);
+      aw_u32(&W, slot);
+      aw_u32(&W, state);
+      C->args_len = W.pos;
+      C->data_offset = 0;
+      C->data_size = 0;
+      bridge_send_void_wl();
+    }
+    return NULL;
+  }
+
+  /* ── wl_webos_shell_surface::set_property (opcode 2) ───────────────────
+   * write name and value as ONE contiguous block so the proxy's
+   * value = name + strlen(name) + 1                  */
+  if (h >= BH_WEBOS_SURF_BASE && h < BH_WEBOS_SURF_BASE + 100 && opcode == 2 &&
+      !interface)
+  {
+    const char *name = va_arg(ap, const char *);
+    const char *value = va_arg(ap, const char *);
+    va_end(ap);
+    if (name && value)
+    {
+#ifdef DEBUG_WAYLAND
+      log_console("wl_proxy_marshal_flags: name:%s value:%s", name, value);
+#endif
+
+      size_t nlen = strlen(name) + 1;
+      size_t vlen = strlen(value) + 1;
+      size_t total = nlen + vlen;
+      char *blob = (char *)alloca(total);
+      memcpy(blob, name, nlen);
+      memcpy(blob + nlen, value, vlen);
+      uint32_t slot = slot_for_webosurf(h);
+      assert(slot != 0);
+      BRIDGE_BEGIN_WL();
+      BridgeCtrl *C = BRIDGE_CTRL_WL();
+      C->opcode = OP_wl_webos_set_property;
+      ArgWriter W = aw_init(C->args, BRIDGE_ARGS_SIZE);
+      aw_u32(&W, slot);
+      C->args_len = W.pos;
+      uint32_t off = bridge_data_write_wl(blob, total);
+      C->data_offset = off;
+      C->data_size = (uint32_t)total;
+      bridge_send_void_wl();
+    }
+    return NULL;
+  }
+
+  /* ── wl_surface::frame (opcode 3) — returns a wl_callback ─────────── */
+  if (h >= BH_SURFACE_BASE && h < BH_SHELL_SURF_BASE && opcode == 3 &&
+      interface)
+  {
+    va_end(ap);
+    uint32_t idx = alloc_callback();
+    g_callbacks[idx].pending = 1;
+    return (struct wl_proxy *)H2P(BH_CALLBACK_BASE + idx);
+  }
+
+  /* ── wl_surface::commit (opcode 6) ─────────────────────────────────── */
+  if (h >= BH_SURFACE_BASE && h < BH_SHELL_SURF_BASE && opcode == 6 &&
+      !interface)
+  {
+    va_end(ap);
+    uint32_t slot = slot_for_surface(h);
+    assert(slot != 0);
+    BRIDGE_BEGIN_WL();
+    BridgeCtrl *C = BRIDGE_CTRL_WL();
+    C->opcode = OP_wl_surface_commit;
+    ArgWriter W = aw_init(C->args, BRIDGE_ARGS_SIZE);
+    aw_u32(&W, slot);
+    C->args_len = W.pos;
+    C->data_offset = 0;
+    C->data_size = 0;
+    bridge_send_void_wl();
+    return NULL;
+  }
+
+  /* ── wl_surface::destroy (opcode 0) ────────────────────────────────── */
+  if (h >= BH_SURFACE_BASE && h < BH_SHELL_SURF_BASE && opcode == 0 &&
+      !interface)
+  {
+    va_end(ap);
+    uint32_t slot = slot_for_surface(h);
+    assert(slot != 0);
+    BRIDGE_BEGIN_WL();
+    BridgeCtrl *C = BRIDGE_CTRL_WL();
+    C->opcode = OP_wl_surface_destroy;
+    ArgWriter W = aw_init(C->args, BRIDGE_ARGS_SIZE);
+    aw_u32(&W, slot);
+    C->args_len = W.pos;
+    C->data_offset = 0;
+    C->data_size = 0;
+    bridge_send_void_wl();
+    return NULL;
+  }
+
+  /* ── wl_seat::get_keyboard (op 0) / get_pointer (op 1) ─────────────── */
+  if (h >= BH_SEAT_BASE && h < BH_SEAT_BASE + MAX_SEATS && interface)
+  {
+#ifdef DEBUG_WAYLAND
+    log_console("wl_proxy_marshal_flags: seat get_keyboard/pointer h=%u "
+                "opcode=%u iface=%s",
+                h, opcode, interface->name);
+#endif
+    uint32_t idx = h - BH_SEAT_BASE;
+    va_end(ap);
+    if (!strcmp(interface->name, "wl_keyboard"))
+      return (struct wl_proxy *)H2P(BH_KEYBOARD_BASE + idx);
+    if (!strcmp(interface->name, "wl_pointer"))
+      return (struct wl_proxy *)H2P(BH_POINTER_BASE + idx);
+    return (struct wl_proxy *)H2P(BH_DUMMY);
+  }
+
+  /* ── wl_starfish_pointer / wl_starfish_output: accept any opcode, return
+   * BH_DUMMY so callers get a non-NULL handle to store listeners on       */
+  if (h == BH_STARFISH_POINTER || h == BH_STARFISH_OUTPUT)
+  {
+    va_end(ap);
+    return interface ? (struct wl_proxy *)H2P(BH_DUMMY) : NULL;
+  }
+
+  /* ── wl_webos_foreign: export_element (op 1) returns a dummy exported
+   * handle; import_element (op 2) returns a dummy imported handle.
+   * destroy (op 0) is a void.                                             */
+  if (h == BH_WEBOS_FOREIGN)
+  {
+    va_end(ap);
+    if (!interface)
+      return NULL; /* destroy or void opcode */
+    /* Both export_element and import_element return a new object */
+    return (struct wl_proxy *)H2P(BH_DUMMY);
+  }
+
+  /* wl_webos_input_manager::get_webos_seat */
+  if (h == BH_WEBOS_INPUT_MGR && interface &&
+      !strcmp(interface->name, "wl_webos_seat"))
+  {
+    (void)va_arg(ap, struct wl_proxy *); /* new_id placeholder */
+    struct wl_proxy *seat = va_arg(ap, struct wl_proxy *);
+    va_end(ap);
+    uint32_t sh = P2H(seat);
+    uint32_t idx = (sh >= BH_SEAT_BASE && sh < BH_SEAT_BASE + MAX_SEATS)
+                       ? (sh - BH_SEAT_BASE)
+                       : 0;
+    return (struct wl_proxy *)H2P(BH_WEBOS_SEAT_BASE + idx);
+  }
+
+  /* ── wl_callback::destroy (opcode 0, no interface) ────────────────── */
+  if (is_callback_handle(h) && !interface)
+  {
+    va_end(ap);
+    uint32_t idx = h - BH_CALLBACK_BASE;
+    g_callbacks[idx].funcs = NULL;
+    g_callbacks[idx].data = NULL;
+    g_callbacks[idx].pending = 0;
+    return NULL;
+  }
+
+  /* ── generic wl_surface opcodes SDL2 calls (attach, damage, scale …) ─ */
+  if (h >= BH_SURFACE_BASE && h < BH_SHELL_SURF_BASE)
+  {
+    va_end(ap);
+    /* constructor opcodes return a dummy; void opcodes return NULL */
+    return interface ? (struct wl_proxy *)H2P(BH_DUMMY) : NULL;
+  }
+
+  va_end(ap);
+  if (interface)
+    return (struct wl_proxy *)H2P(BH_DUMMY);
+  return NULL;
+}
+
+struct wl_proxy *
+wl_proxy_marshal_constructor(struct wl_proxy *proxy, uint32_t opcode,
+                             const struct wl_interface *interface, ...)
+{
+  if (!IS_BRIDGE_PROXY(proxy))
+    return REAL(wl_proxy_marshal_constructor)(proxy, opcode, interface);
+  return wl_proxy_marshal_flags(proxy, opcode, interface, 0, 0);
+}
+
+struct wl_proxy *
+wl_proxy_marshal_array_constructor(struct wl_proxy *proxy, uint32_t opcode,
+                                   union wl_argument *args,
+                                   const struct wl_interface *interface)
+{
+  if (!IS_BRIDGE_PROXY((struct wl_proxy *)proxy))
+    return REAL(wl_proxy_marshal_array_constructor)(proxy, opcode, args,
+                                                    interface);
+
+  uint32_t h = resolve_handle(P2H(proxy));
+
+#ifdef DEBUG_WAYLAND_VERBOSE
+  log_console("wl_proxy_marshal_array_constructor h=%u opcode=%u iface=%s", h,
+              opcode, interface ? interface->name : "(null)");
+#endif
+
+  if (((h == BH_SHELL && opcode == 0) ||
+       (h == BH_WEBOS_SHELL && (opcode == 0 || opcode == 1))) &&
+      interface)
+  {
+    struct wl_proxy *surf = (struct wl_proxy *)args[1].o;
+#ifdef DEBUG_WAYLAND_VERBOSE
+    log_console("wl_proxy_marshal_array_constructor: shell get_shell_surface "
+                "h=%u opcode=%u surf=%p surf_h=%u",
+                h, opcode, surf, P2H(surf));
+#endif
+    return wl_proxy_marshal_flags(proxy, opcode, interface, 0, 0, (void *)NULL,
+                                  surf);
+  }
+
+  if (h >= BH_WEBOS_SURF_BASE && h < BH_WEBOS_SURF_BASE + 100 && !interface)
+  {
+    switch (opcode)
+    {
+    case 2: /* set_property(string name, string value) */
+    {
+      const char *name = args[0].s;
+      const char *value = args[1].s;
+#ifdef DEBUG_WAYLAND
+      log_console("wl_proxy_marshal_array_constructor: "
+                  "wl_webos_shell_surface set_property name=%s value=%s",
+                  name ? name : "(null)", value ? value : "(null)");
+#endif
+      wl_proxy_marshal_flags(proxy, opcode, NULL, 0, 0, name, value);
+      break;
+    }
+    default:
+      /* Other void opcodes with no args or unknown layout */
+      wl_proxy_marshal_flags(proxy, opcode, NULL, 0, 0);
+      break;
+    }
+    return NULL;
+  }
+
+  if (interface)
+    return wl_proxy_marshal_flags(proxy, opcode, interface, 0, 0);
+
+  wl_proxy_marshal_flags(proxy, opcode, NULL, 0, 0);
+  return NULL;
+}
+
+struct wl_proxy *
+wl_proxy_marshal_constructor_versioned(struct wl_proxy *proxy, uint32_t opcode,
+                                       const struct wl_interface *interface,
+                                       uint32_t version, ...)
+{
+  if (!IS_BRIDGE_PROXY(proxy))
+  {
+    va_list ap;
+    va_start(ap, version);
+    uint32_t a0 = va_arg(ap, uint32_t);
+    const char *a1 = va_arg(ap, const char *);
+    uint32_t a2 = va_arg(ap, uint32_t);
+    va_end(ap);
+    union wl_argument args[3];
+    args[0].u = a0;
+    args[1].s = a1;
+    args[2].u = a2;
+    return REAL(wl_proxy_marshal_array_constructor_versioned)(
+        proxy, opcode, args, interface, version);
+  }
+  return wl_proxy_marshal_flags(proxy, opcode, interface, version, 0);
+}
+
+struct wl_proxy *wl_proxy_marshal_array_constructor_versioned(
+    struct wl_proxy *proxy, uint32_t opcode, union wl_argument *args,
+    const struct wl_interface *interface, uint32_t version)
+{
+  if (!IS_BRIDGE_PROXY((struct wl_proxy *)proxy))
+    return REAL(wl_proxy_marshal_array_constructor_versioned)(
+        proxy, opcode, args, interface, version);
+
+  uint32_t h = resolve_handle(P2H(proxy));
+
+  if ((h == BH_SHELL || h == BH_WEBOS_SHELL) && opcode == 0 && interface)
+  {
+    struct wl_proxy *surf = (struct wl_proxy *)args[1].o;
+    return wl_proxy_marshal_flags(proxy, opcode, interface, version, 0, surf);
+  }
+
+  if (interface)
+    return wl_proxy_marshal_flags(proxy, opcode, interface, version, 0);
+
+  wl_proxy_marshal_flags(proxy, opcode, NULL, version, 0);
+  return NULL;
+}
+
+void wl_proxy_marshal(struct wl_proxy *proxy, uint32_t opcode, ...)
+{
+  if (!IS_BRIDGE_PROXY(proxy))
+    return;
+  uint32_t h = resolve_handle(P2H(proxy));
+  /* wl_surface::commit via legacy wl_proxy_marshal (opcode 6) */
+  if (h >= BH_SURFACE_BASE && h < BH_SHELL_SURF_BASE && opcode == 6)
+  {
+    uint32_t slot = slot_for_surface(h);
+    assert(slot != 0);
+    BRIDGE_BEGIN_WL();
+    BridgeCtrl *C = BRIDGE_CTRL_WL();
+    C->opcode = OP_wl_surface_commit;
+    ArgWriter W = aw_init(C->args, BRIDGE_ARGS_SIZE);
+    aw_u32(&W, slot);
+    C->args_len = W.pos;
+    C->data_offset = 0;
+    C->data_size = 0;
+    bridge_send_void_wl();
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Cursor — return NULL when called with bridge objects
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+struct wl_cursor_theme *wl_cursor_theme_load(const char *name, int size,
+                                             struct wl_shm *shm)
+{
+  if (!IS_BH(shm))
+    return REAL(wl_cursor_theme_load)(name, size, shm);
+  return NULL;
+}
+
+struct wl_cursor *wl_cursor_theme_get_cursor(struct wl_cursor_theme *t,
+                                             const char *name)
+{
+  (void)t;
+  (void)name;
+  return NULL;
+}
+
+void wl_cursor_theme_destroy(struct wl_cursor_theme *t)
+{
+  if (t)
+    REAL(wl_cursor_theme_destroy)(t);
+}
+
+void wl_proxy_set_user_data(struct wl_proxy *proxy, void *user_data)
+{
+#ifdef DEBUG_WAYLAND
+  log_console("wl_proxy_set_user_data: proxy=%p user_data=%p", proxy,
+              user_data);
+#endif
+
+  if (!IS_BRIDGE_PROXY(proxy))
+  {
+    REAL(wl_proxy_set_user_data)(proxy, user_data);
+    return;
+  }
+  uint32_t h = P2H(proxy);
+  if (h < MAX_PROXY_USERDATA)
+    g_proxy_userdata[h] = user_data;
+}
+
+void *wl_proxy_get_user_data(struct wl_proxy *proxy)
+{
+  if (!IS_BRIDGE_PROXY(proxy))
+    return REAL(wl_proxy_get_user_data)(proxy);
+
+  uint32_t h = P2H(proxy);
+  void *ret = NULL;
+
+  if (h < MAX_PROXY_USERDATA)
+    ret = g_proxy_userdata[h];
+
+#ifdef DEBUG_WAYLAND
+  log_console("wl_proxy_get_user_data: proxy=%p h=%u -> ret=%p", proxy, h, ret);
+#endif
+
+  return ret;
+}
+
+void wl_proxy_set_tag(struct wl_proxy *proxy, const char *const *tag)
+{
+  if (!IS_BRIDGE_PROXY(proxy))
+  {
+    REAL(wl_proxy_set_tag)(proxy, tag);
+    return;
+  }
+
+  uint32_t h = P2H(proxy);
+
+  if (h < MAX_PROXY_TAGS)
+    g_proxy_tags[h] = tag;
+}
+
+const char *const *wl_proxy_get_tag(struct wl_proxy *proxy)
+{
+  if (!IS_BRIDGE_PROXY(proxy))
+    return REAL(wl_proxy_get_tag)(proxy);
+
+  uint32_t h = P2H(proxy);
+
+  if (h < MAX_PROXY_TAGS)
+    return g_proxy_tags[h];
+
+  return NULL;
+}
+
+struct wl_event_queue *wl_display_create_queue(struct wl_display *dpy)
+{
+  if (!IS_BRIDGE_DPY(dpy))
+    return REAL(wl_display_create_queue)(dpy);
+  return BRIDGE_DUMMY_QUEUE;
+}
+
+void wl_event_queue_destroy(struct wl_event_queue *queue)
+{
+  if (queue && queue != BRIDGE_DUMMY_QUEUE)
+    REAL(wl_event_queue_destroy)(queue);
+}
+
+/* wl_proxy_create_wrapper */
+void *wl_proxy_create_wrapper(void *proxy)
+{
+  if (!IS_BRIDGE_PROXY((struct wl_proxy *)proxy))
+    return REAL(wl_proxy_create_wrapper)(proxy);
+
+  if (IS_BRIDGE_DPY(proxy))
+  {
+    /* Only the pure-C internal path (e.g. real lib's
+     * wl_display_roundtrip_queue) wraps a display directly */
+    return proxy;
+  }
+
+  uint32_t target = resolve_handle(P2H(proxy));
+
+  for (uint32_t i = 0; i < MAX_WRAPPERS; i++)
+  {
+    if (!g_wrapper_target[i])
+    {
+      g_wrapper_target[i] = target;
+#ifdef DEBUG_WAYLAND
+      log_console("wl_proxy_create_wrapper: target=%u -> wrapper handle=%u",
+                  target, BH_WRAPPER_BASE + i);
+#endif
+      return (void *)H2P(BH_WRAPPER_BASE + i);
+    }
+  }
+
+  log_error("wl_proxy_create_wrapper: no free wrapper slots (target=%u)",
+            target);
+  return NULL;
+}
+
+void wl_proxy_wrapper_destroy(void *proxy_wrapper)
+{
+  if (!IS_BRIDGE_PROXY((struct wl_proxy *)proxy_wrapper))
+  {
+    REAL(wl_proxy_wrapper_destroy)(proxy_wrapper);
+    return;
+  }
+
+  if (IS_BRIDGE_DPY(proxy_wrapper))
+    return; /* passthrough display wrapper — nothing was allocated */
+
+  uint32_t h = P2H(proxy_wrapper);
+
+  if (is_wrapper_handle(h))
+    g_wrapper_target[h - BH_WRAPPER_BASE] = 0;
+
+  /* Free the wrapper's own user-data/tag slots */
+  if (h < MAX_PROXY_USERDATA)
+    g_proxy_userdata[h] = NULL;
+  if (h < MAX_PROXY_TAGS)
+    g_proxy_tags[h] = NULL;
+}
+
+void wl_proxy_set_queue(struct wl_proxy *proxy, struct wl_event_queue *queue)
+{
+  if (!IS_BRIDGE_PROXY(proxy))
+    REAL(wl_proxy_set_queue)(proxy, queue);
+  /* Bridge proxy: queue concept doesn't apply, silently ignore */
+}

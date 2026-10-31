@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="webos_screen_zoom">
+
+    <copyright>
+      Copyright (c) 2025 LG Electronics, Inc.
+
+      Licensed under the Apache License, Version 2.0 (the "License");
+      you may not use this file except in compliance with the License.
+      You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+      Unless required by applicable law or agreed to in writing, software
+      distributed under the License is distributed on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+      See the License for the specific language governing permissions and
+      limitations under the License.
+    </copyright>
+
+    <interface name="wl_webos_screen_zoom" version="1">
+      <description summary="api to screen zoom"/>
+
+      <event name="notify_minimap_position">
+        <description summary="send zoom position to system UI"/>
+        <arg name="x" type="fixed" summary="pan x"/>
+        <arg name="y" type="fixed" summary="pan y"/>
+        <arg name="scale" type="fixed" summary="scale aspect"/>
+      </event>
+
+      <enum name="webos_zoom_mode_type">
+        <description summary="type of screen zoom mode"/>
+        <entry name="zoom_control_mode" value="0" summary="zoom mode"/>
+        <entry name="app_control_mode" value="1" summary="app mode"/>
+      </enum>
+
+      <event name="notify_mode">
+          <description summary="send current zoom mode to system UI"/>
+          <arg name="mode" type="uint" enum="webos_zoom_mode_type" summary="zoom mode type"/>
+      </event>
+
+      <enum name="webos_zoom_guide_visible_type">
+        <description summary="type of screen zoom guide visible"/>
+        <entry name="zoom_guide_hidden" value="0" summary="guide hidden"/>
+        <entry name="zoom_guide_visible" value="1" summary="guide visible"/>
+        <entry name="zoom_guide_part_visible" value="2" summary="guide partial visible"/>
+      </enum>
+
+      <event name="set_guide_visible">
+          <description summary="request focus"/>
+          <arg name="visibility" type="uint" enum="set_guide_visible" summary="guide visibility"/>
+      </event>
+
+    </interface>
+</protocol>

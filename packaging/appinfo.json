@@ -1,0 +1,13 @@
+{
+  "id": "org.ppsspp.webos",
+  "title": "PPSSPP",
+  "version": "0.1.10",
+  "vendor": "PPSSPP",
+  "type": "native",
+  "main": "PPSSPPSDL",
+  "icon": "icon-114.png",
+  "resolution": "1920x1080",
+  "useAllMouseButtons": true,
+  "useAllKeyboardKeys": true,
+  "cloudgame_active": true
+}

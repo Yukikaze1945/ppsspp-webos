@@ -1,0 +1,1513 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6120c3e..c367257 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,3 +1,4 @@
++# Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ # vim:noexpandtab:
+ cmake_minimum_required(VERSION 3.16)
+ project(PPSSPP)
+@@ -118,7 +119,11 @@ endif()
+ include(CheckCXXSourceCompiles)
+ include(GNUInstallDirs)
+ 
+-add_compile_definitions(ASSETS_DIR="${CMAKE_INSTALL_FULL_DATADIR}/ppsspp/assets/")
++if(WEBOS)
++	add_compile_definitions(ASSETS_DIR="/media/developer/apps/usr/palm/applications/org.ppsspp.webos/assets/")
++else()
++	add_compile_definitions(ASSETS_DIR="${CMAKE_INSTALL_FULL_DATADIR}/ppsspp/assets/")
++endif()
+ 
+ if(OPENXR AND NOT ARMV7_DEVICE)
+ 	add_compile_definitions(OPENXR)
+@@ -232,6 +237,11 @@ else()
+ endif()
+ 
+ if(WEBOS)
++	set_source_files_properties(SDL/SDLMain.cpp PROPERTIES COMPILE_DEFINITIONS PPSSPP_WEBOS)
++	set_source_files_properties(SDL/SDLGLGraphicsContext.cpp PROPERTIES COMPILE_DEFINITIONS PPSSPP_WEBOS)
++	set_source_files_properties(Common/Render/Text/draw_text_sdl.cpp PROPERTIES COMPILE_DEFINITIONS PPSSPP_WEBOS)
++	# GLES entry-point variables in gl3stub must not interpose Bridge functions.
++	string(APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/webos-symbols.map")
+ 	set(USING_X11_VULKAN OFF)
+ 	set(USING_GLES2 ON)
+ 	set(USE_SYSTEM_ZSTD OFF)
+@@ -363,6 +373,9 @@ if(NOT LIBRETRO AND NOT IOS AND NOT HEADLESS_CROSS AND NOT ANDROID)
+ 		endif()
+ 	endif()
+ 	set(SDL_TTF_LIB_TARGET SDL3_ttf::SDL3_ttf)
++	# Common's text abstraction includes SDL_ttf headers as well as the SDL frontend.
++	get_target_property(SDL_TTF_INCLUDES SDL3_ttf::SDL3_ttf INTERFACE_INCLUDE_DIRECTORIES)
++	include_directories(${SDL_TTF_INCLUDES})
+ 	message(STATUS "Using SDL3 and SDL3_ttf")
+ 	add_compile_definitions(USE_SDL3_TTF)
+ 	find_package(Fontconfig QUIET)
+@@ -986,6 +999,10 @@ else()
+ 	endif()
+ 	# Require SDL
+ 	add_compile_definitions(SDL)
++	if(WEBOS)
++		list(APPEND targetExtra SDL/WebOSWindow.cpp)
++		list(APPEND targetExtraLibs wayland-client wayland-webos-client)
++	endif()
+ 	list(APPEND targetExtra
+ 		SDL/SDLJoystick.h
+ 		SDL/SDLJoystick.cpp
+diff --git a/Common/GPU/OpenGL/GLRenderManager.cpp b/Common/GPU/OpenGL/GLRenderManager.cpp
+index 7a76017..4beabd0 100644
+--- a/Common/GPU/OpenGL/GLRenderManager.cpp
++++ b/Common/GPU/OpenGL/GLRenderManager.cpp
+@@ -1,3 +1,5 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
++#include "Common/Profiler/WebOSPerf.h"
+ #include "ppsspp_config.h"
+ #include "GLRenderManager.h"
+ #include "Common/GPU/OpenGL/GLFeatures.h"
+@@ -151,6 +153,7 @@ bool GLRenderManager::ThreadFrame() {
+ 		// Pop a task off the queue and execute it. Exiting this loop is done with a special EXIT task,
+ 		// to keep things uniform.
+ 		{
++			WebOSPerfSpan perf("gl-task-queue-wait");
+ 			std::unique_lock<std::mutex> lock(pushMutex_);
+ 			pushCondVar_.wait(lock, [this] { return !renderThreadQueue_.empty(); });
+ 			task = renderThreadQueue_.front();
+@@ -325,6 +328,7 @@ void GLRenderManager::CopyImageToMemorySync(GLRTexture *texture, int mipLevel, i
+ }
+ 
+ void GLRenderManager::BeginFrame(bool enableProfiling) {
++	WebOSPerfSpan perf("gl-frame-fence-wait");
+ 	_dbg_assert_(!exitNotified_);
+ 	_dbg_assert_(!hitExit_);
+ 
+@@ -419,6 +423,7 @@ void GLRenderManager::Present() {
+ 
+ // Render thread. Returns true if the caller should handle a swap.
+ bool GLRenderManager::Run(GLRRenderThreadTask &task) {
++	WebOSPerfSpan perf("gl-run-tail");
+ 	_dbg_assert_(task.frame >= 0);
+ 
+ 	GLFrameData &frameData = frameData_[task.frame];
+@@ -437,6 +442,7 @@ bool GLRenderManager::Run(GLRRenderThreadTask &task) {
+ 			if (swapFunction_) {
+ 				VLOG("  PULL: SwapFunction()");
+ 				swapFunction_();
++				perf.Checkpoint("gl-swap");
+ 			}
+ 			swapRequest = true;
+ 		} else {
+@@ -464,6 +470,7 @@ bool GLRenderManager::Run(GLRRenderThreadTask &task) {
+ 
+ 	// queueRunner_.LogSteps(stepsOnThread);
+ 	queueRunner_.RunInitSteps(task.initSteps, skipGLCalls_);
++	perf.Checkpoint("gl-init-steps");
+ 
+ 	// Run this after RunInitSteps so any fresh GLRBuffers for the pushbuffers can get created.
+ 	if (!skipGLCalls_) {
+@@ -474,6 +481,7 @@ bool GLRenderManager::Run(GLRRenderThreadTask &task) {
+ 		}
+ 	}
+ 
++	perf.Checkpoint("gl-upload");
+ 	if (frameData.profile.enabled) {
+ 		frameData.profile.cpuStartTime = time_now_d();
+ 	}
+@@ -498,6 +506,7 @@ bool GLRenderManager::Run(GLRRenderThreadTask &task) {
+ 		queueRunner_.RunSteps(task.steps, frameData, skipGLCalls_, false, false);
+ 	}
+ 
++	perf.Checkpoint("gl-run-steps");
+ 	if (frameData.profile.enabled) {
+ 		frameData.profile.cpuEndTime = time_now_d();
+ 	}
+diff --git a/Common/Profiler/WebOSPerf.h b/Common/Profiler/WebOSPerf.h
+new file mode 100644
+index 0000000..8eec197
+--- /dev/null
++++ b/Common/Profiler/WebOSPerf.h
+@@ -0,0 +1,41 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
++#pragma once
++
++// Opt-in wall-clock checkpoints for the webOS port. No timing or I/O when off.
++#include <cstdint>
++#if defined(__linux__) && defined(__aarch64__)
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <sys/syscall.h>
++#include <unistd.h>
++#include "Common/TimeUtil.h"
++#endif
++
++class WebOSPerfSpan {
++public:
++	explicit WebOSPerfSpan(const char *stage) : stage_(stage) {
++#if defined(__linux__) && defined(__aarch64__)
++		static const bool enabled = [] {
++			const char *p = std::getenv("PPSSPP_BRIDGE_PROFILE");
++			return p && std::strcmp(p, "1") == 0;
++		}();
++		if (enabled) start_ = time_now_raw();
++#endif
++	}
++	~WebOSPerfSpan() { Checkpoint(stage_); }
++	void Checkpoint(const char *stage) {
++#if defined(__linux__) && defined(__aarch64__)
++		if (!start_) return;
++		const uint64_t end = time_now_raw();
++		if (end - start_ > 50000000ULL)
++			std::fprintf(stderr, "[perf-span] {\"stage\":\"%s\",\"start_ns\":%llu,\"end_ns\":%llu,\"ns\":%llu,\"tid\":%ld}\n",
++				stage, (unsigned long long)start_, (unsigned long long)end,
++				(unsigned long long)(end - start_), syscall(SYS_gettid));
++		start_ = end;
++#endif
++	}
++private:
++	const char *stage_;
++	uint64_t start_ = 0;
++};
+diff --git a/Common/Render/Text/draw_text_sdl.cpp b/Common/Render/Text/draw_text_sdl.cpp
+index ab93190..6af0516 100644
+--- a/Common/Render/Text/draw_text_sdl.cpp
++++ b/Common/Render/Text/draw_text_sdl.cpp
+@@ -1,3 +1,4 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ #include "ppsspp_config.h"
+ 
+ #include "Common/Log.h"
+@@ -13,6 +14,7 @@
+ #include "Common/Render/Text/draw_text.h"
+ #include "Common/Render/Text/draw_text_sdl.h"
+ #include <clocale>
++#include <algorithm>
+ 
+ #if defined(USE_SDL3_TTF)
+ 
+@@ -152,6 +154,13 @@ TextDrawerSDL::~TextDrawerSDL() {
+ 
+ // If a user complains about missing characters on SDL, re-visit this!
+ void TextDrawerSDL::PrepareFallbackFonts(std::string_view locale) {
++#ifdef PPSSPP_WEBOS
++	const Path bundledCJKFont("/media/developer/apps/usr/palm/applications/org.ppsspp.webos/assets/fonts/NotoSansCJKsc-Regular.otf");
++	if (File::Exists(bundledCJKFont)) {
++		fallbackFontPaths_.emplace_back(bundledCJKFont.ToString(), 0);
++		INFO_LOG(Log::G3D, "Using bundled webOS CJK fallback font");
++	}
++#endif
+ #if defined(USE_SDL3_TTF_FONTCONFIG)
+ 	FcObjectSet *os = FcObjectSetBuild (FC_FILE, FC_INDEX, (char *) 0);
+ 
+@@ -362,7 +371,7 @@ void TextDrawerSDL::EnsureFont(const FontStyle &style) {
+ 	TTF_Font *font = nullptr;
+ 	uint8_t *fileData = nullptr;
+ 	std::string useFont = GetFilenameForFontStyle(style) + ".ttf";
+-	const int ptSize = static_cast<int>(style.sizePts / dpiScale_ * 1.25f);
++	const int ptSize = std::max(1, static_cast<int>(style.sizePts / dpiScale_ * 1.25f));
+ 	DEBUG_LOG(Log::G3D, "Loading SDL font '%s' from VFS at size %d pts", useFont.c_str(), ptSize);
+ 
+ 	size_t fileSz;
+@@ -372,7 +381,7 @@ void TextDrawerSDL::EnsureFont(const FontStyle &style) {
+ 		DEBUG_LOG(Log::G3D, "Opened font from RW: '%p' '%d'", fileData, (int)fileSz);
+ 		font = TTF_OpenFontIO(rw, true, static_cast<float>(ptSize));
+ 		if (!font) {
+-			ERROR_LOG(Log::G3D, "Failed to load font from asset file: '%s'", useFont.c_str());
++			ERROR_LOG(Log::G3D, "Failed to load font from asset file: '%s': %s", useFont.c_str(), SDL_GetError());
+ 		}
+ 	} else {
+ 		ERROR_LOG(Log::G3D, "Failed to load font file %s from VFS", useFont.c_str());
+diff --git a/Core/CMakeLists.txt b/Core/CMakeLists.txt
+index ae05e86..faf7b22 100644
+--- a/Core/CMakeLists.txt
++++ b/Core/CMakeLists.txt
+@@ -1,3 +1,4 @@
++# Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ set(CoreExtra)
+ 
+ list(APPEND CoreExtra
+@@ -819,3 +820,6 @@ if(NOT MSVC)
+ 	list(FILTER CoreCPUSources INCLUDE REGEX "^MIPS/")
+ 	set_source_files_properties(${CoreCPUSources} PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+ endif()
++if(WEBOS)
++	set_source_files_properties(MIPS/MIPS.cpp Instance.cpp MIPS/IR/IRJit.cpp FrameTiming.cpp PROPERTIES COMPILE_DEFINITIONS PPSSPP_WEBOS)
++endif()
+diff --git a/Core/Debugger/WebSocket/GPUStatsSubscriber.cpp b/Core/Debugger/WebSocket/GPUStatsSubscriber.cpp
+index 03e2d3c..60043ae 100644
+--- a/Core/Debugger/WebSocket/GPUStatsSubscriber.cpp
++++ b/Core/Debugger/WebSocket/GPUStatsSubscriber.cpp
+@@ -1,3 +1,4 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ // Copyright (c) 2021- PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -15,7 +16,10 @@
+ // Official git repository and contact information can be found at
+ // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
+ 
++#include "Common/Profiler/WebOSPerf.h"
+ #include <mutex>
++#include <string>
++#include "Common/TimeUtil.h"
+ #include <vector>
+ 
+ #include "Common/Data/Text/StringWriter.h"
+@@ -32,6 +36,9 @@ struct CollectedStats {
+ 	std::vector<float> frameTimes;
+ 	std::vector<float> sleepTimes;
+ 	int frameTimePos;
++	uint64_t sequence = 0;
++	bool compact = false;
++	uint64_t mono_ns = 0;
+ };
+ 
+ struct DebuggerGPUStatsEvent {
+@@ -42,6 +49,10 @@ struct DebuggerGPUStatsEvent {
+ 		JsonWriter j;
+ 		j.begin();
+ 		j.writeString("event", "gpu.stats.get");
++		if (s.compact) {
++            j.writeInt("sequence", (int64_t)s.sequence);
++            j.writeRaw("mono_ns", std::to_string(s.mono_ns));
++        }
+ 		if (!ticket.empty())
+ 			j.writeRaw("ticket", ticket);
+ 		j.pushDict("fps");
+@@ -84,6 +95,9 @@ struct WebSocketGPUStatsState : public DebuggerSubscriber {
+ 	bool forced_ = false;
+ 	bool sendNext_ = false;
+ 	bool sendFeed_ = false;
++	bool compact_ = false;
++	uint64_t sequence_ = 0;
++	uint64_t lastCompactFlip_ = 0;
+ 
+ 	std::string lastTicket_;
+ 	std::mutex pendingLock_;
+@@ -116,19 +130,34 @@ void WebSocketGPUStatsState::FlipForwarder(void *thiz) {
+ }
+ 
+ void WebSocketGPUStatsState::FlipListener() {
++	WebOSPerfSpan perf("stats-flip-work");
+ 	if (!sendNext_ && !sendFeed_)
+ 		return;
+ 
+ 	// Okay, collect the data (we'll actually send at next Broadcast.)
+ 	std::lock_guard<std::mutex> guard(pendingLock_);
++	perf.Checkpoint("stats-flip-lock");
+ 	pendingStats_.resize(pendingStats_.size() + 1);
+ 	CollectedStats &stats = pendingStats_[pendingStats_.size() - 1];
+ 
+ 	__DisplayGetFPS(&stats.vps, &stats.fps, &stats.actual_fps);
+ 
+-	StringWriter w(stats.statbuf);
+-	__DisplayGetDebugStats(w);
++	stats.compact = compact_;
++	stats.sequence = ++sequence_;
++	stats.statbuf[0] = 0;
++	if (!compact_) {
++		StringWriter w(stats.statbuf);
++		__DisplayGetDebugStats(w);
++	}
+ 
++    if (compact_) {
++        stats.mono_ns = time_now_raw();
++        stats.frameTimePos = 0;
++        if (lastCompactFlip_ != 0) stats.frameTimes.assign(1, (stats.mono_ns-lastCompactFlip_) * 1e-9f);
++        lastCompactFlip_ = stats.mono_ns;
++        sendNext_ = false;
++        return;
++    }
+ 	int valid;
+ 	float *sleepHistory;
+ 	float *history = __DisplayGetFrameTimes(&valid, &stats.frameTimePos, &sleepHistory);
+@@ -186,15 +215,26 @@ void WebSocketGPUStatsState::Feed(DebuggerRequest &req) {
+ 	if (!req.ParamBool("enable", &enable, DebuggerParamType::OPTIONAL))
+ 		return;
+ 
+-	std::lock_guard<std::mutex> guard(pendingLock_);
+-	sendFeed_ = enable;
+-	if (forced_ != enable) {
+-		Core_RunOnCPUThread([enable] { PSP_ForceDebugStats(enable); });
+-		forced_ = enable;
++	bool compact = false;
++    if (!req.ParamBool("compact", &compact, DebuggerParamType::OPTIONAL)) return;
++	bool changeStats;
++    const bool forceStats = enable && !compact;
++	{
++		std::lock_guard<std::mutex> guard(pendingLock_);
++		sendFeed_ = enable;
++		compact_ = compact;
++		changeStats = forced_ != forceStats;
++		forced_ = forceStats;
++        lastCompactFlip_ = 0;
+ 	}
++	// The CPU's flip listener takes pendingLock_. Do not wait for that CPU
++	// thread while holding the same lock.
++	if (changeStats)
++		Core_RunOnCPUThread([forceStats] { PSP_ForceDebugStats(forceStats); });
+ }
+ 
+ void WebSocketGPUStatsState::Broadcast(net::WebSocketServer *ws) {
++	WebOSPerfSpan perf("stats-broadcast");
+ 	std::lock_guard<std::mutex> guard(pendingLock_);
+ 	if (lastTicket_.empty() && !sendFeed_) {
+ 		pendingStats_.clear();
+diff --git a/Core/FrameTiming.cpp b/Core/FrameTiming.cpp
+index 79a6e46..d119f74 100644
+--- a/Core/FrameTiming.cpp
++++ b/Core/FrameTiming.cpp
+@@ -1,3 +1,4 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ // Frame timing
+ //
+ // A frame on the main thread should look a bit like this:
+@@ -20,6 +21,10 @@
+ // * The game not actually asking for flips, like in static loading screens
+ 
+ #include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <cstdio>
++#include <cinttypes>
+ #include "ppsspp_config.h"
+ #include "Common/Profiler/Profiler.h"
+ #include "Common/Log.h"
+@@ -41,6 +46,10 @@ constexpr double g_MaxSleepTime = 0.5;  // 500ms.
+ 
+ // Note: To avoid hang bugs, this has a maximum of 0.5 second wait time.
+ void WaitUntil(double now, double timestamp, const char *reason) {
++#ifdef PPSSPP_WEBOS
++    static const bool profile = [] { const char *p=std::getenv("PPSSPP_BRIDGE_PROFILE"); return p && std::strcmp(p,"1")==0; }();
++    const uint64_t profileStart=profile?time_now_raw():0;
++#endif
+ #if 1
+ 	// Use precise timing.
+ 	sleep_precise(std::min(timestamp - now, g_MaxSleepTime), reason);
+@@ -58,6 +67,14 @@ void WaitUntil(double now, double timestamp, const char *reason) {
+ 	}
+ #endif
+ 
++#endif
++#ifdef PPSSPP_WEBOS
++    if (profile) {
++        const uint64_t end=time_now_raw();
++        if (end-profileStart>50000000ull) std::fprintf(stderr,
++            "[perf-wait] {\"reason\":\"%s\",\"start_ns\":%" PRIu64 ",\"end_ns\":%" PRIu64 ",\"ns\":%" PRIu64 ",\"requested_ms\":%.6f}\n",
++            reason,profileStart,end,end-profileStart,std::min(timestamp-now,g_MaxSleepTime)*1000.0);
++    }
+ #endif
+ }
+ 
+diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
+index 03eec4b..58ac300 100644
+--- a/Core/HLE/sceDisplay.cpp
++++ b/Core/HLE/sceDisplay.cpp
+@@ -1,3 +1,4 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ // Copyright (c) 2012- PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -15,6 +16,7 @@
+ // Official git repository and contact information can be found at
+ // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
+ 
++#include "Common/Profiler/WebOSPerf.h"
+ #include <algorithm>
+ #include <cmath>
+ #include <map>
+@@ -535,6 +537,7 @@ static void DoFrameTiming(bool throttle, bool *skipFrame, float scaledTimestep,
+ }
+ 
+ static void DoFrameIdleTiming() {
++	WebOSPerfSpan perf("display-idle-timing");
+ 	PROFILE_THIS_SCOPE("timing");
+ 	if (!FrameTimingThrottled() || !g_Config.bEnableSound || wasPaused || lagSyncScheduled) {
+ 		return;
+diff --git a/Core/HW/Display.cpp b/Core/HW/Display.cpp
+index f21d442..fc3ad8e 100644
+--- a/Core/HW/Display.cpp
++++ b/Core/HW/Display.cpp
+@@ -1,3 +1,4 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ // Copyright (c) 2012- PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -15,6 +16,7 @@
+ // Official git repository and contact information can be found at
+ // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
+ 
++#include "Common/Profiler/WebOSPerf.h"
+ #include <atomic>
+ #include <algorithm>
+ #include <cmath>
+@@ -250,6 +252,26 @@ void DisplayFireVblankEnd() {
+ }
+ 
+ void DisplayFireFlip() {
++#if defined(__linux__) && defined(__aarch64__)
++	// Independent, buffered local trace: does not require a debugger stats subscriber.
++	static FILE *trace = []() -> FILE * {
++		const char *enabled = std::getenv("PPSSPP_FRAME_TRACE");
++		if (!enabled || std::strcmp(enabled, "1") != 0) return nullptr;
++		char path[160];
++		std::snprintf(path, sizeof(path), "/media/developer/ppsspp-webos-data/perf-frames-%d.csv", getpid());
++		FILE *f = std::fopen(path, "w");
++		if (f) std::setvbuf(f, nullptr, _IOFBF, 16384);
++		return f;
++	}();
++	if (trace) {
++		WebOSPerfSpan span("local-frame-trace-io");
++		static uint64_t sequence = 0;
++		std::fprintf(trace, "%llu,%llu,%llu\n", (unsigned long long)time_now_raw(),
++			(unsigned long long)CoreTiming::GetGlobalTimeUs(), (unsigned long long)++sequence);
++		if (sequence % 64 == 0) std::fflush(trace);
++	}
++#endif
++	WebOSPerfSpan perf("display-flip-listeners");
+ 	std::vector<FlipListener> toCall = [] {
+ 		std::lock_guard<std::mutex> guard(listenersLock);
+ 		return flipListeners;
+diff --git a/Core/Instance.cpp b/Core/Instance.cpp
+index 09cba0c..dd1ce69 100644
+--- a/Core/Instance.cpp
++++ b/Core/Instance.cpp
+@@ -1,3 +1,4 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ // Copyright (c) 2020 PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -115,6 +116,9 @@ static bool UpdateInstanceCounter(void (*callback)(volatile InstanceInfo *)) {
+ }
+ 
+ int GetInstancePeerCount() {
++#ifdef PPSSPP_WEBOS
++    return 1;
++#endif
+ 	static int c = 0;
+ 	UpdateInstanceCounter([](volatile InstanceInfo *buf) {
+ 		c = buf->total;
+@@ -125,6 +129,10 @@ int GetInstancePeerCount() {
+ // Get current number of instance of PPSSPP running.
+ // Must be called only once during init.
+ void InitInstanceCounter() {
++#ifdef PPSSPP_WEBOS
++    PPSSPP_ID = 1;
++    return;
++#endif
+ #if PPSSPP_PLATFORM(WINDOWS)
+ 	uint32_t BUF_SIZE = 4096;
+ 	SYSTEM_INFO sysInfo;
+@@ -180,6 +188,9 @@ void InitInstanceCounter() {
+ }
+ 
+ void ShutdownInstanceCounter() {
++#ifdef PPSSPP_WEBOS
++    return;
++#endif
+ 	UpdateInstanceCounter([](volatile InstanceInfo *buf) {
+ 		buf->total--;
+ 	});
+diff --git a/Core/MIPS/IR/IRJit.cpp b/Core/MIPS/IR/IRJit.cpp
+index ecc8398..ccbf672 100644
+--- a/Core/MIPS/IR/IRJit.cpp
++++ b/Core/MIPS/IR/IRJit.cpp
+@@ -1,3 +1,4 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ // Copyright (c) 2012- PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -16,6 +17,11 @@
+ // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
+ 
+ #include "ppsspp_config.h"
++#include <atomic>
++#include <cinttypes>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <set>
+ #include <algorithm>
+ 
+@@ -50,6 +56,69 @@
+ 
+ namespace MIPSComp {
+ 
++#if defined(PPSSPP_WEBOS) && PPSSPP_ARCH(ARM64)
++namespace {
++
++class WebOSJitCompileTimer {
++public:
++	explicit WebOSJitCompileTimer(u32 guestAddr) : guestAddr_(guestAddr) {
++		static const bool enabled = [] {
++			const char *setting = std::getenv("PPSSPP_BRIDGE_PROFILE");
++			return setting && std::strcmp(setting, "1") == 0;
++		}();
++		enabled_ = enabled;
++		if (enabled_)
++			startNs_ = time_now_raw();
++	}
++
++	~WebOSJitCompileTimer() {
++		if (!enabled_)
++			return;
++		const uint64_t endNs = time_now_raw();
++		const uint64_t elapsedNs = endNs >= startNs_ ? endNs - startNs_ : 0;
++		const uint64_t totalCount = compileCount.fetch_add(1, std::memory_order_relaxed) + 1;
++		const uint64_t totalNs = compileNs.fetch_add(elapsedNs, std::memory_order_relaxed) + elapsedNs;
++		uint64_t previousMax = maxCompileNs.load(std::memory_order_relaxed);
++		while (elapsedNs > previousMax &&
++			!maxCompileNs.compare_exchange_weak(previousMax, elapsedNs, std::memory_order_relaxed)) {
++		}
++
++		if (elapsedNs > UINT64_C(2000000)) {
++			std::fprintf(stderr,
++				"[perf-jit-slow] {\"guest_addr\":\"%08x\",\"ns\":%" PRIu64
++				",\"mono_ns\":%" PRIu64 "}\n",
++				guestAddr_, elapsedNs, endNs);
++		}
++
++		uint64_t last = lastEmitNs.load(std::memory_order_relaxed);
++		if (endNs >= last && endNs - last >= UINT64_C(1000000000) &&
++			lastEmitNs.compare_exchange_strong(last, endNs, std::memory_order_relaxed)) {
++			std::fprintf(stderr,
++				"[perf-jit] {\"kind\":\"whole_jit_compile\",\"mono_ns\":%" PRIu64
++				",\"compile_count\":%" PRIu64 ",\"compile_ns\":%" PRIu64
++				",\"max_ns\":%" PRIu64 "}\n",
++				endNs, totalCount, totalNs, maxCompileNs.load(std::memory_order_relaxed));
++		}
++	}
++
++private:
++	bool enabled_ = false;
++	u32 guestAddr_;
++	uint64_t startNs_ = 0;
++	static std::atomic<uint64_t> compileCount;
++	static std::atomic<uint64_t> compileNs;
++	static std::atomic<uint64_t> maxCompileNs;
++	static std::atomic<uint64_t> lastEmitNs;
++};
++
++std::atomic<uint64_t> WebOSJitCompileTimer::compileCount{0};
++std::atomic<uint64_t> WebOSJitCompileTimer::compileNs{0};
++std::atomic<uint64_t> WebOSJitCompileTimer::maxCompileNs{0};
++std::atomic<uint64_t> WebOSJitCompileTimer::lastEmitNs{0};
++
++}  // namespace
++#endif
++
+ IRJit::IRJit(MIPSState *mipsState, bool compileToNative) : frontend_(mipsState->HasDefaultPrefix()), mips_(mipsState) {
+ 	// u32 size = 128 * 1024;
+ 	InitIR();
+@@ -230,6 +299,9 @@ void IRJit::InvalidateCacheExcept(const std::vector<std::pair<u32, u32>> &keep)
+ }
+ 
+ void IRJit::Compile(u32 em_address) {
++#if defined(PPSSPP_WEBOS) && PPSSPP_ARCH(ARM64)
++	WebOSJitCompileTimer jitTimer(em_address);
++#endif
+ 	_dbg_assert_(compilerEnabled_);
+ 
+ 	PROFILE_THIS_SCOPE("jitc");
+diff --git a/Core/MIPS/MIPS.cpp b/Core/MIPS/MIPS.cpp
+index 05c319e..cfc4537 100644
+--- a/Core/MIPS/MIPS.cpp
++++ b/Core/MIPS/MIPS.cpp
+@@ -1,3 +1,4 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ // Copyright (c) 2012- PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -43,6 +44,9 @@
+ #include "Core/Core.h"
+ #include "Core/System.h"
+ #include "Core/MIPS/JitCommon/JitCommon.h"
++#ifdef PPSSPP_WEBOS
++#include "Core/MIPS/JitCommon/JitBlockCache.h"
++#endif
+ #include "Core/CoreTiming.h"
+ #include "Core/HLE/ReplaceTables.h"
+ #include "Core/MIPS/MeCore.h"
+@@ -532,6 +536,18 @@ int MIPSState::RunLoopUntil(u64 globalTicks) {
+ 		}
+ 		ProcessPendingInvalidates();
+ 		jit->RunLoopUntil(globalTicks);
++#ifdef PPSSPP_WEBOS
++		{
++			static bool reportedNativeJit = false;
++			if (!reportedNativeJit && PSP_CoreParameter().cpuCore == CPUCore::JIT) {
++				int blocks = jit->GetBlockCacheDebugInterface()->GetNumBlocks();
++				if (blocks > 0) {
++					NOTICE_LOG(Log::Boot, "webOS native ARM64 JIT executed: %d compiled blocks", blocks);
++					reportedNativeJit = true;
++				}
++			}
++		}
++#endif
+ 		break;
+ 
+ 	case CPUCore::INTERPRETER:
+diff --git a/SDL/SDLGLGraphicsContext.cpp b/SDL/SDLGLGraphicsContext.cpp
+index 16dbac2..fc6702e 100644
+--- a/SDL/SDLGLGraphicsContext.cpp
++++ b/SDL/SDLGLGraphicsContext.cpp
+@@ -1,6 +1,10 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ #include <vector>
+ 
+ #include "SDLGLGraphicsContext.h"
++#ifdef PPSSPP_WEBOS
++#include "WebOSWindow.h"
++#endif
+ 
+ #include "Common/GPU/OpenGL/GLFeatures.h"
+ #include "Common/GPU/thin3d_create.h"
+@@ -372,6 +376,13 @@ SDL_Window *CreateSDLGLWindowAndContext(int x, int y, int w, int h, int mode, in
+ 			continue;
+ 		}
+ 
++		#ifdef PPSSPP_WEBOS
++		if (!WebOSAttachWindow(window)) {
++			SDL_DestroyWindow(window);
++			window = nullptr;
++			continue;
++		}
++		#endif
+ 		glContext = SDL_GL_CreateContext(window);
+ 		if (glContext) {
+ 			// Victory, got one. Window should now be valid.
+@@ -474,6 +485,9 @@ bool SDLGLGraphicsContext::InitSurface(WindowSystem winsys, void *data1, void *d
+ 
+ 	// Finally we can do the regular initialization.
+ 	CheckGLExtensions();
++#ifdef PPSSPP_WEBOS
++	NOTICE_LOG(Log::Boot, "webOS GLES renderer: %s; version: %s", glGetString(GL_RENDERER), glGetString(GL_VERSION));
++#endif
+ 	draw_ = Draw::T3DCreateGLContext(true);
+ 	renderManager_ = (GLRenderManager *)draw_->GetNativeObject(Draw::NativeObject::RENDER_MANAGER);
+ 	renderManager_->SetInflightFrames(g_Config.iInflightFrames);
+@@ -515,5 +529,8 @@ void SDLGLGraphicsContext::ShutdownAPI() {
+ #endif
+ 	SDL_GL_DestroyContext(glContext_);
+ 	glContext_ = nullptr;
++#ifdef PPSSPP_WEBOS
++	WebOSDetachWindow(window_);
++#endif
+ 	window_ = nullptr;
+ }
+diff --git a/SDL/SDLMain.cpp b/SDL/SDLMain.cpp
+index ce74862..3b51e27 100644
+--- a/SDL/SDLMain.cpp
++++ b/SDL/SDLMain.cpp
+@@ -1,3 +1,4 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ 
+ #include <cstdlib>
+ #include <unistd.h>
+@@ -69,6 +70,9 @@ SDLJoystick *joystick = NULL;
+ #include "Core/ConfigValues.h"
+ #include "Core/HLE/sceUsbMic.h"
+ #include "SDLGLGraphicsContext.h"
++#ifdef PPSSPP_WEBOS
++#include "WebOSWindow.h"
++#endif
+ #include "SDLUtil.h"
+ 
+ #include <SDL3/SDL_vulkan.h>
+@@ -1376,6 +1380,11 @@ case SYSPROP_HAS_FILE_BROWSER:
+ 
+ void System_Notify(SystemNotification notification) {
+ 	switch (notification) {
++#ifdef PPSSPP_WEBOS
++    case SystemNotification::KEEP_SCREEN_AWAKE:
++        WebOSScreenSaverActivity();
++        break;
++#endif
+ 	case SystemNotification::AUDIO_RESET_DEVICE:
+ 		StopSDLAudioDevice();
+ 		InitSDLAudioDevice();
+@@ -1993,14 +2002,67 @@ void UpdateSDLCursor() {
+ #endif
+ }
+ 
++#ifdef PPSSPP_WEBOS
++#include <sys/syscall.h>
++class WebOSPerfStage {
++public:
++    explicit WebOSPerfStage(const char *name, const int *events=nullptr) : name_(name), events_(events) {
++        static const bool enabled=[] { const char *p=std::getenv("PPSSPP_BRIDGE_PROFILE"); return p && p[0]=='1'; }();
++        start_=enabled?time_now_raw():0;
++    }
++    ~WebOSPerfStage() {
++        if (!start_) return;
++        uint64_t end=time_now_raw();
++        if (end-start_>50000000ull) std::fprintf(stderr,
++            "[perf-stage] {\"stage\":\"%s\",\"start_ns\":%llu,\"end_ns\":%llu,\"ns\":%llu,\"tid\":%ld,\"events\":%d}\n",
++            name_,(unsigned long long)start_,(unsigned long long)end,(unsigned long long)(end-start_),
++            (long)syscall(SYS_gettid),events_?*events_:0);
++    }
++private:
++    const char *name_;
++    const int *events_;
++    uint64_t start_;
++};
++#endif
++
+ #ifdef _WIN32
+ #undef main
+ #endif
+ int main(int argc, char *argv[]) {
++#ifdef PPSSPP_WEBOS
++	// Keep the native application independent of the system HOME and libraries.
++	setenv("HOME", "/media/developer/ppsspp-webos-data", 1);
++	setenv("XDG_CONFIG_HOME", "/media/developer/ppsspp-webos-data/config", 1);
++	setenv("XDG_RUNTIME_DIR", "/tmp/xdg", 0);
++	setenv("WAYLAND_DISPLAY", "wayland-0", 0);
++	setenv("SDL_VIDEO_DRIVER", "wayland", 0);
++	setenv("SDL_AUDIO_DRIVER", "pulseaudio", 0);
++	setenv("PULSE_SERVER", "unix:/var/run/pulse/native", 0);
++	setenv("GLES_PROXY_BIN", "/media/developer/apps/usr/palm/applications/org.ppsspp.webos/service/gles_proxy", 1);
++	setenv("APPID", "org.ppsspp.webos", 1);
++	File::CreateFullPath(Path("/media/developer/ppsspp-webos-data"));
++	chdir("/media/developer/apps/usr/palm/applications/org.ppsspp.webos");
++	freopen("/media/developer/ppsspp-webos-data/ppsspp.log", "a", stderr);
++	setvbuf(stderr, nullptr, _IOLBF, 0);
++	fprintf(stderr, "Starting PPSSPP webOS AArch64\n");
++	if (!WebOSPrepareBridge()) return 0;
++	WebOSMountUSB();
++	SDL_SetHint(SDL_HINT_APP_ID, "org.ppsspp.webos");
++	// webOS passes launch metadata as JSON, not a PSP game pathname.
++	if (argc == 2 && argv[1][0] == '{' && strstr(argv[1], "@system_native_app"))
++		argc = 1;
++#endif
+ 	TimeInit();
+ 
+ 	CommandLineOptions cmdLineOptions;
+ 	CommandLineParseResult parseResult = cmdLineOptions.Parse(argc, (const char **)argv);
++#ifdef PPSSPP_WEBOS
++	cmdLineOptions.fullscreen = true;
++	cmdLineOptions.xres = 1920;
++	cmdLineOptions.yres = 1080;
++	if (!cmdLineOptions.memStick.has_value())
++		cmdLineOptions.memStick = "/media/developer/ppsspp-webos-data";
++#endif
+ 	switch (parseResult) {
+ 	case CommandLineParseResult::Exit:
+ 		return 0;
+@@ -2206,6 +2268,15 @@ int main(int argc, char *argv[]) {
+ 	// After NativeInit, code should no longer look at cmdLineOptions, they should have been translated
+ 	// into g_Config settings. This is because NativeInit may modify g_Config settings based on the command line options.
+ 	NativeInit(argc, (const char **)argv, cmdLineOptions, path, external_dir, nullptr);
++#ifdef PPSSPP_WEBOS
++    WebOSScreenSaverStart();
++#endif
++#ifdef PPSSPP_WEBOS
++    const std::string usbRoot = "/tmp/usb";
++    if (File::Exists(Path(usbRoot)) &&
++        std::find(g_Config.vPinnedPaths.begin(), g_Config.vPinnedPaths.end(), usbRoot) == g_Config.vPinnedPaths.end())
++        g_Config.vPinnedPaths.push_back(usbRoot);
++#endif
+ 
+ 	// Use the setting from the config when initing the window.
+ 	if (g_Config.bFullScreen) {
+@@ -2453,6 +2524,9 @@ int main(int argc, char *argv[]) {
+ 	std::thread battery_poll_thread([&battery_poll_thread_sema, &stop_battery_poll_thread] {
+ 		while (!stop_battery_poll_thread) {
+ 			SDL_WaitSemaphore(battery_poll_thread_sema);
++#ifdef PPSSPP_WEBOS
++            WebOSPerfStage powerStage("sdl-power-query");
++#endif
+ 			SDL_GetPowerInfo(nullptr, &g_batteryPercent);
+ 		}
+ 	});
+@@ -2475,7 +2549,10 @@ int main(int argc, char *argv[]) {
+ 
+ 		std::thread emuThread = std::thread([&] {
+ 			RunMainLoop(graphicsContext, new NativeApplication(), [&](GraphicsContext *graphicsContext) {
+-				NativeFrame(graphicsContext);
++	#ifdef PPSSPP_WEBOS
++            WebOSPerfStage nativeStage("native-frame");
++#endif
++			NativeFrame(graphicsContext);
+ 				bool keepRunning = !(g_QuitRequested || g_RestartRequested);
+ 				if (!keepRunning) {
+ 					INFO_LOG(Log::System, "EmuThread was requested to exit normally.");
+@@ -2500,13 +2577,26 @@ int main(int argc, char *argv[]) {
+ 			if (g_QuitRequested || g_RestartRequested)
+ 				break;
+ 
+-			UpdateTextFocus(window);
+-			UpdateSDLCursor();
++            {
++#ifdef PPSSPP_WEBOS
++                WebOSPerfStage cursorStage("sdl-cursor-focus");
++#endif
++			    UpdateTextFocus(window);
++			    UpdateSDLCursor();
++            }
+ #if !PPSSPP_PLATFORM(MAC)
+ 			kick_battery_poll_thread();
++#ifdef PPSSPP_WEBOS
++            WebOSScreenSaverPulse();
++#endif
+ #endif
+ 
+-			inputTracker.MouseCaptureControl(window);
++            {
++#ifdef PPSSPP_WEBOS
++                WebOSPerfStage captureStage("sdl-mouse-capture");
++#endif
++			    inputTracker.MouseCaptureControl(window);
++            }
+ 
+ 			{
+ 				std::lock_guard<std::mutex> guard(g_mutexWindow);
+@@ -2520,30 +2610,54 @@ int main(int argc, char *argv[]) {
+ 	} else {
+ 		// OpenGL mode uses this path.
+ 		std::thread emuThread = EmuThread_Start(graphicsContext, new NativeApplication(), [&](GraphicsContext *graphicsContext){
++#ifdef PPSSPP_WEBOS
++            WebOSPerfStage nativeStage("native-frame");
++#endif
+ 			NativeFrame(graphicsContext);
+ 			return true;
+ 		});
+ 		while (true) {
+ 			// OpenGL mode uses this.
+ 			{
++                int eventCount=0;
++#ifdef PPSSPP_WEBOS
++                WebOSPerfStage pumpStage("sdl-poll-events",&eventCount);
++#endif
+ 				SDL_Event event;
+ 				while (SDL_PollEvent(&event)) {
++                    ++eventCount;
+ 					ProcessSDLEvent(window, event, &inputTracker);
+ 				}
+ 			}
+ 			if (g_QuitRequested || g_RestartRequested)
+ 				break;
+ 
+-			UpdateTextFocus(window);
+-			UpdateSDLCursor();
++            {
++#ifdef PPSSPP_WEBOS
++                WebOSPerfStage cursorStage("sdl-cursor-focus");
++#endif
++			    UpdateTextFocus(window);
++			    UpdateSDLCursor();
++            }
+ #if !PPSSPP_PLATFORM(MAC)
+ 			kick_battery_poll_thread();
++#ifdef PPSSPP_WEBOS
++            WebOSScreenSaverPulse();
++#endif
+ #endif
+ 
+-			inputTracker.MouseCaptureControl(window);
++            {
++#ifdef PPSSPP_WEBOS
++                WebOSPerfStage captureStage("sdl-mouse-capture");
++#endif
++			    inputTracker.MouseCaptureControl(window);
++            }
+ 
+ 			bool renderThreadPaused = Native_IsWindowHidden() && g_Config.bPauseWhenMinimized;
+ 			if (graphicsContext->NeedsSeparateEmuThread() && !renderThreadPaused) {
++#ifdef PPSSPP_WEBOS
++                WebOSPerfStage renderStage("render-thread-frame");
++#endif
+ 				if (!graphicsContext->ThreadFrame()) {
+ 					// The render thread was instructed to exit by the emu thread,
+ 					// and has now reached the end of the submitted frames.
+@@ -2560,6 +2674,9 @@ int main(int argc, char *argv[]) {
+ 				}
+ 			}
+ 		}
++#ifdef PPSSPP_WEBOS
++        if (g_QuitRequested) StopSDLAudioDevice();
++#endif
+ 		INFO_LOG(Log::System, "Requesting render thread exit...");
+ 		EmuThread_Join(graphicsContext, emuThread);
+ 	}
+@@ -2610,5 +2727,8 @@ int main(int argc, char *argv[]) {
+ 		execv("/proc/self/exe", exec_argv);
+ #endif
+ 	}
++#ifdef PPSSPP_WEBOS
++    if (!g_RestartRequested) WebOSNotifyAppExit();
++#endif
+ 	return 0;
+ }
+diff --git a/SDL/WebOSWindow.cpp b/SDL/WebOSWindow.cpp
+new file mode 100644
+index 0000000..67c211b
+--- /dev/null
++++ b/SDL/WebOSWindow.cpp
+@@ -0,0 +1,311 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
++#include "WebOSWindow.h"
++
++#include <algorithm>
++#include <atomic>
++#include <sys/prctl.h>
++#include "Common/TimeUtil.h"
++#include <cerrno>
++#include <cstring>
++#include <cstdio>
++#include <cstdlib>
++#include <cstdint>
++#include <vector>
++#include <unistd.h>
++#include <signal.h>
++#include <sys/ipc.h>
++#include <sys/shm.h>
++#include <sys/file.h>
++#include <sys/wait.h>
++#include <fcntl.h>
++#include <dlfcn.h>
++
++#include <wayland-client.h>
++#include <wayland-webos-shell-client-protocol.h>
++
++namespace {
++struct WindowState {
++    SDL_Window *window = nullptr;
++    wl_display *display = nullptr;
++    wl_registry *registry = nullptr;
++    wl_shell *shell = nullptr;
++    wl_webos_shell *webosShell = nullptr;
++    wl_shell_surface *shellSurface = nullptr;
++    wl_webos_shell_surface *webosShellSurface = nullptr;
++};
++
++std::vector<WindowState> g_attachedWindows;
++
++void RegistryGlobal(void *data, wl_registry *registry, uint32_t name,
++                    const char *interface, uint32_t version) {
++    auto *state = static_cast<WindowState *>(data);
++    if (std::strcmp(interface, wl_shell_interface.name) == 0 && !state->shell) {
++        state->shell = static_cast<wl_shell *>(wl_registry_bind(
++            registry, name, &wl_shell_interface, std::min(version, 1u)));
++    } else if (std::strcmp(interface, wl_webos_shell_interface.name) == 0 && !state->webosShell) {
++        state->webosShell = static_cast<wl_webos_shell *>(wl_registry_bind(
++            registry, name, &wl_webos_shell_interface, std::min(version, 1u)));
++    }
++}
++
++void RegistryGlobalRemove(void *, wl_registry *, uint32_t) {
++}
++
++const wl_registry_listener kRegistryListener = {
++    RegistryGlobal,
++    RegistryGlobalRemove,
++};
++
++void DestroyState(WindowState &state) {
++    if (state.webosShellSurface) {
++        wl_webos_shell_surface_destroy(state.webosShellSurface);
++        state.webosShellSurface = nullptr;
++    }
++    if (state.shellSurface) {
++        wl_shell_surface_destroy(state.shellSurface);
++        state.shellSurface = nullptr;
++    }
++    if (state.webosShell) {
++        wl_webos_shell_destroy(state.webosShell);
++        state.webosShell = nullptr;
++    }
++    if (state.shell) {
++        wl_shell_destroy(state.shell);
++        state.shell = nullptr;
++    }
++    if (state.registry) {
++        wl_registry_destroy(state.registry);
++        state.registry = nullptr;
++    }
++}
++
++bool RoundtripFailed(wl_display *display) {
++    if (wl_display_roundtrip(display) >= 0) {
++        return false;
++    }
++    std::fprintf(stderr, "[webos] Wayland registry roundtrip failed\n");
++    return true;
++}
++}  // namespace
++
++bool WebOSPrepareBridge() {
++    // Keep one emulator per application; the proxy must not inherit this lock.
++    static int instanceLock = open("/media/developer/ppsspp-webos-data/run.lock",
++        O_CREAT | O_RDWR | O_CLOEXEC, 0600);
++    if (instanceLock < 0 || flock(instanceLock, LOCK_EX | LOCK_NB) < 0) {
++        std::fprintf(stderr, "[webos] another PPSSPP instance already owns the application lock\n");
++        return false;
++    }
++    const char *path = "/media/developer/ppsspp-webos-data/last-pid";
++    long previous = 0;
++    if (FILE *file = std::fopen(path, "r")) {
++        if (std::fscanf(file, "%ld", &previous) != 1) previous = 0;
++        std::fclose(file);
++    }
++    // Never touch active segments or segments created by a different application run.
++    if (previous > 0 && kill((pid_t)previous, 0) < 0 && errno == ESRCH) {
++        const key_t base = (key_t)(0x50500000u + (uint32_t)previous * 8u);
++        for (key_t key = base + 1; key <= base + 4; ++key) {
++            int id = shmget(key, 0, 0600);
++            shmid_ds info{};
++            if (id >= 0 && shmctl(id, IPC_STAT, &info) == 0 &&
++                info.shm_cpid == previous && info.shm_nattch == 0 &&
++                info.shm_perm.uid == geteuid()) {
++                shmctl(id, IPC_RMID, nullptr);
++            }
++        }
++    }
++    char baseText[32];
++    const uint32_t base = 0x50500000u + (uint32_t)getpid() * 8u;
++    std::snprintf(baseText, sizeof(baseText), "0x%x", base);
++    setenv("PPSSPP_BRIDGE_SHM_BASE", baseText, 1);
++    std::fprintf(stderr, "[webos] private Bridge IPC base=%s\n", baseText);
++    if (FILE *file = std::fopen(path, "w")) {
++        std::fprintf(file, "%ld\n", (long)getpid());
++        std::fclose(file);
++    }
++    return true;
++}
++
++void WebOSMountUSB() {
++    // Native devmode jails do not include removable-device mounts on this TV.
++    // Use the already-installed Homebrew root service for our fixed helper;
++    // its only operation is a read-only bind into this app's own jail.
++    const pid_t child = fork();
++    if (child == 0) {
++        const int log = open("/media/developer/ppsspp-webos-data/usb-mount.log",
++            O_CREAT | O_TRUNC | O_WRONLY, 0644);
++        if (log >= 0) { dup2(log, STDOUT_FILENO); dup2(log, STDERR_FILENO); close(log); }
++        execl("/usr/bin/timeout", "timeout", "8", "/usr/bin/luna-send-pub",
++            "-n", "1",
++            "luna://org.webosbrew.hbchannel.service/exec",
++            "{\"command\":\"/media/developer/apps/usr/palm/applications/org.ppsspp.webos/service/usb-mount-helper\"}",
++            (char *)nullptr);
++        _exit(127);
++    }
++    if (child > 0) {
++        int status;
++        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
++    }
++}
++
++namespace {
++std::atomic<uint64_t> g_lastGameplayNs{0};
++int g_screenSaverPipe = -1;
++pid_t g_screenSaverPid = -1;
++}
++
++void WebOSScreenSaverActivity() {
++    g_lastGameplayNs.store(time_now_raw(), std::memory_order_relaxed);
++}
++
++void WebOSScreenSaverStart() {
++    int fds[2];
++    if (pipe2(fds, O_CLOEXEC) < 0) return;
++    const pid_t parent = getpid();
++    const pid_t child = fork();
++    if (child == 0) {
++        prctl(PR_SET_PDEATHSIG, SIGTERM);
++        if (getppid() != parent) _exit(1);
++        dup2(fds[0], STDIN_FILENO);
++        close(fds[0]); close(fds[1]);
++        const int log = open("/media/developer/ppsspp-webos-data/screensaver.log",
++            O_CREAT | O_TRUNC | O_WRONLY, 0644);
++        if (log >= 0) { dup2(log, STDOUT_FILENO); dup2(log, STDERR_FILENO); close(log); }
++        execl("/media/developer/apps/usr/palm/applications/org.ppsspp.webos/service/screensaver-guard",
++            "screensaver-guard", (char *)nullptr);
++        _exit(127);
++    }
++    close(fds[0]);
++    if (child < 0) { close(fds[1]); return; }
++    g_screenSaverPipe = fds[1]; g_screenSaverPid = child;
++    fcntl(g_screenSaverPipe, F_SETFL, fcntl(g_screenSaverPipe, F_GETFL) | O_NONBLOCK);
++    std::atexit(WebOSScreenSaverStop);
++}
++
++void WebOSScreenSaverPulse() {
++    static uint64_t last = 0;
++    if (g_screenSaverPipe < 0) return;
++    const uint64_t now = time_now_raw();
++    if (now - last < 1000000000ULL) return;
++    last = now;
++    const uint64_t gameplay = g_lastGameplayNs.load(std::memory_order_relaxed);
++    const char value = gameplay && now - gameplay < 1500000000ULL ? '1' : '0';
++    if (write(g_screenSaverPipe, &value, 1) < 0 && errno == EPIPE) {
++        close(g_screenSaverPipe); g_screenSaverPipe = -1;
++    }
++}
++
++void WebOSScreenSaverStop() {
++    if (g_screenSaverPipe >= 0) { close(g_screenSaverPipe); g_screenSaverPipe = -1; }
++    if (g_screenSaverPid > 0) {
++        // Bridge's SIGCHLD handler may already have reaped this child.
++        // Never signal a stale PID after it has stopped being our child.
++        const pid_t child = g_screenSaverPid;
++        g_screenSaverPid = -1;
++        if (waitpid(child, nullptr, WNOHANG) == 0) {
++            kill(child, SIGTERM);
++            while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
++        }
++    }
++}
++
++void WebOSNotifyAppExit() {
++    WebOSScreenSaverStop();
++    if (auto shutdownBridge = (void (*)())dlsym(RTLD_DEFAULT, "ppsspp_bridge_shutdown")) {
++        shutdownBridge();
++    }
++    // Let SAM know this is an intentional exit rather than an unexpected death.
++    const pid_t child = fork();
++    if (child == 0) {
++        execl("/usr/bin/luna-send-pub", "luna-send-pub", "-n", "1",
++            "luna://com.webos.applicationManager/closeByAppId",
++            "{\"id\":\"org.ppsspp.webos\"}", (char *)nullptr);
++        _exit(127);
++    }
++    if (child > 0) {
++        for (int i = 0; i < 20; ++i) {
++            if (waitpid(child, nullptr, WNOHANG) != 0) return;
++            usleep(100000);
++        }
++        kill(child, SIGTERM);
++        waitpid(child, nullptr, 0);
++    }
++}
++
++bool WebOSAttachWindow(SDL_Window *window) {
++    if (!window) {
++        std::fprintf(stderr, "[webos] cannot attach a null SDL window\n");
++        return false;
++    }
++    const auto existing = std::find_if(g_attachedWindows.begin(), g_attachedWindows.end(),
++        [window](const WindowState &state) { return state.window == window; });
++    if (existing != g_attachedWindows.end()) {
++        return true;
++    }
++
++    const SDL_PropertiesID properties = SDL_GetWindowProperties(window);
++    auto *display = static_cast<wl_display *>(SDL_GetPointerProperty(
++        properties, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr));
++    auto *surface = static_cast<wl_surface *>(SDL_GetPointerProperty(
++        properties, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, nullptr));
++    if (!display || !surface) {
++        std::fprintf(stderr, "[webos] SDL window has no Wayland display/surface\n");
++        return false;
++    }
++
++    WindowState state;
++    state.window = window;
++    state.display = display;
++    state.registry = wl_display_get_registry(display);
++    if (!state.registry || wl_registry_add_listener(state.registry, &kRegistryListener, &state) < 0 ||
++        RoundtripFailed(display)) {
++        DestroyState(state);
++        return false;
++    }
++    if (!state.shell || !state.webosShell) {
++        std::fprintf(stderr, "[webos] compositor is missing wl_shell or wl_webos_shell\n");
++        DestroyState(state);
++        return false;
++    }
++
++    state.shellSurface = wl_shell_get_shell_surface(state.shell, surface);
++    if (!state.shellSurface) {
++        std::fprintf(stderr, "[webos] failed to create wl_shell_surface\n");
++        DestroyState(state);
++        return false;
++    }
++    wl_shell_surface_set_toplevel(state.shellSurface);
++
++    state.webosShellSurface = wl_webos_shell_get_shell_surface(state.webosShell, surface);
++    if (!state.webosShellSurface) {
++        std::fprintf(stderr, "[webos] failed to create wl_webos_shell_surface\n");
++        DestroyState(state);
++        return false;
++    }
++    wl_webos_shell_surface_set_property(state.webosShellSurface, "appId", "org.ppsspp.webos");
++    wl_webos_shell_surface_set_property(state.webosShellSurface, "title", "PPSSPP");
++    wl_webos_shell_surface_set_property(state.webosShellSurface, "displayAffinity", "0");
++    wl_webos_shell_surface_set_property(state.webosShellSurface,
++        "_WEBOS_ACCESS_POLICY_KEYS_BACK", "true");
++
++    if (wl_display_flush(display) < 0 && errno != EAGAIN && errno != EINTR) {
++        std::fprintf(stderr, "[webos] failed to flush shell-surface requests\n");
++        DestroyState(state);
++        return false;
++    }
++    g_attachedWindows.push_back(state);
++    std::fprintf(stderr, "[webos] attached PPSSPP window to webOS shell\n");
++    return true;
++}
++
++void WebOSDetachWindow(SDL_Window *window) {
++    const auto attached = std::find_if(g_attachedWindows.begin(), g_attachedWindows.end(),
++        [window](const WindowState &state) { return state.window == window; });
++    if (attached == g_attachedWindows.end()) {
++        return;
++    }
++    DestroyState(*attached);
++    g_attachedWindows.erase(attached);
++    std::fprintf(stderr, "[webos] detached PPSSPP window from webOS shell\n");
++}
+diff --git a/SDL/WebOSWindow.h b/SDL/WebOSWindow.h
+new file mode 100644
+index 0000000..be09204
+--- /dev/null
++++ b/SDL/WebOSWindow.h
+@@ -0,0 +1,14 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
++#pragma once
++
++#include <SDL3/SDL.h>
++
++bool WebOSAttachWindow(SDL_Window *window);
++bool WebOSPrepareBridge();
++void WebOSMountUSB();
++void WebOSScreenSaverStart();
++void WebOSScreenSaverActivity();
++void WebOSScreenSaverPulse();
++void WebOSScreenSaverStop();
++void WebOSNotifyAppExit();
++void WebOSDetachWindow(SDL_Window *window);
+diff --git a/UI/EmuScreen.cpp b/UI/EmuScreen.cpp
+index f033b15..16c4e5b 100644
+--- a/UI/EmuScreen.cpp
++++ b/UI/EmuScreen.cpp
+@@ -1,3 +1,4 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ // Copyright (c) 2012- PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -15,6 +16,7 @@
+ // Official git repository and contact information can be found at
+ // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
+ 
++#include "Common/Profiler/WebOSPerf.h"
+ #include "ppsspp_config.h"
+ 
+ #include <functional>
+@@ -1865,6 +1867,7 @@ bool EmuScreen::AllowFocusMovement() const {
+ }
+ 
+ ScreenRenderFlags EmuScreen::RunEmulation(bool skipBufferEffects) {
++	WebOSPerfSpan perf("emu-tail");
+ 	using namespace Draw;
+ 	ScreenRenderFlags flags = ScreenRenderFlags::NONE;
+ 
+@@ -1929,7 +1932,9 @@ ScreenRenderFlags EmuScreen::RunEmulation(bool skipBufferEffects) {
+ 			}
+ 		}
+ 
++		perf.Checkpoint("emu-pre-loop");
+ 		PSP_RunLoopWhileState();
++		perf.Checkpoint("emu-run-loop");
+ 
+ 		// Hopefully, after running, coreState is now CORE_NEXTFRAME
+ 		switch (coreState) {
+diff --git a/UI/NativeApp.cpp b/UI/NativeApp.cpp
+index 7f3a667..0344338 100644
+--- a/UI/NativeApp.cpp
++++ b/UI/NativeApp.cpp
+@@ -1,3 +1,4 @@
++// Community webOS modifications, 2026-10-31; see MODIFICATIONS.md.
+ // Copyright (c) 2012- PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -23,6 +24,7 @@
+ //
+ // Windows has its own code that bypasses the framework entirely.
+ 
++#include "Common/Profiler/WebOSPerf.h"
+ #include "ppsspp_config.h"
+ 
+ #include "ext/rcheevos/include/rc_client.h"
+@@ -1192,6 +1194,7 @@ void NativeShutdownGraphics(GraphicsContext *graphicsContext) {
+ static void SendMouseDeltaAxis();
+ 
+ void NativeFrame(GraphicsContext *graphicsContext) {
++	WebOSPerfSpan perf("native-tail");
+ 	PROFILE_END_FRAME();
+ 
+ 	if (!(Core_IsActive() || Core_IsStepping()))
+@@ -1268,7 +1271,9 @@ void NativeFrame(GraphicsContext *graphicsContext) {
+ 		debugFlags |= Draw::DebugFlags::PROFILE_TIMESTAMPS;
+ 	if (g_Config.bGpuLogProfiler)
+ 		debugFlags |= Draw::DebugFlags::PROFILE_SCOPES;
++	perf.Checkpoint("native-pre-begin");
+ 	g_draw->BeginFrame(debugFlags);
++	perf.Checkpoint("native-begin-frame");
+ 
+ 	g_screenManager->ProcessScreenSwitches();
+ 
+@@ -1324,7 +1329,8 @@ void NativeFrame(GraphicsContext *graphicsContext) {
+ 		}
+ 	}
+ 
+-	g_screenManager->Update();  // This must happen *after* input event processing!
++	g_screenManager->Update();
++	perf.Checkpoint("native-update");  // This must happen *after* input event processing!
+ 
+ 	// Do this after g_screenManager.update() so we can receive setting changes before rendering.
+ 	{
+@@ -1380,6 +1386,7 @@ void NativeFrame(GraphicsContext *graphicsContext) {
+ 	ScreenRenderFlags renderFlags = ScreenRenderFlags::NONE;
+ 	{
+ 		std::lock_guard<std::mutex> emuStateGuard(g_frameMutex);
++		perf.Checkpoint("native-frame-mutex");
+ 
+ 		// Apply the UIContext bounds as a 2D transformation matrix.
+ 		// NOTE: We compensate for the Y and Z conventions in the shaders, so we can use the same matrices in all backends.
+@@ -1401,6 +1408,7 @@ void NativeFrame(GraphicsContext *graphicsContext) {
+ 		renderFlags = g_screenManager->Render([]() {
+ 			runImDebugger(g_draw);
+ 		});
++		perf.Checkpoint("native-screen-render");
+ 		renderImDebugger(g_draw);
+ 		// Last, since the readback ends the backbuffer pass. Nothing can draw after it.
+ 		ScreenshotNotifyEndOfFrame(g_draw);
+@@ -1410,10 +1418,12 @@ void NativeFrame(GraphicsContext *graphicsContext) {
+ 		ui_draw2d.PopDrawMatrix();
+ 	}
+ 	g_draw->EndFrame();
++	perf.Checkpoint("native-end-frame");
+ 
+ 	// This, between EndFrame and Present, is where we should actually wait to do present time management.
+ 	// There might not be a meaningful distinction here for all backends..
+ 	g_frameTiming.PostSubmit();
++	perf.Checkpoint("native-post-submit");
+ 
+ 	if (renderCounter < 10 && ++renderCounter == 10) {
+ 		// We're rendering fine, clear out failure info.
+@@ -1421,6 +1431,7 @@ void NativeFrame(GraphicsContext *graphicsContext) {
+ 	}
+ 
+ 	g_draw->Present(g_frameTiming.PresentMode());
++	perf.Checkpoint("native-present");
+ 
+ 	// Not done if we resized at the start of the frame, the swapchain is new.
+ 	if (!resizedThisFrame) {
+diff --git a/assets/fonts/OFL.txt b/assets/fonts/OFL.txt
+new file mode 100644
+index 0000000..e26f2ab
+--- /dev/null
++++ b/assets/fonts/OFL.txt
+@@ -0,0 +1,92 @@
++This Font Software is licensed under the SIL Open Font License,
++Version 1.1.
++
++This license is copied below, and is also available with a FAQ at:
++http://scripts.sil.org/OFL
++
++-----------------------------------------------------------
++SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
++-----------------------------------------------------------
++
++PREAMBLE
++The goals of the Open Font License (OFL) are to stimulate worldwide
++development of collaborative font projects, to support the font
++creation efforts of academic and linguistic communities, and to
++provide a free and open framework in which fonts may be shared and
++improved in partnership with others.
++
++The OFL allows the licensed fonts to be used, studied, modified and
++redistributed freely as long as they are not sold by themselves. The
++fonts, including any derivative works, can be bundled, embedded,
++redistributed and/or sold with any software provided that any reserved
++names are not used by derivative works. The fonts and derivatives,
++however, cannot be released under any other type of license. The
++requirement for fonts to remain under this license does not apply to
++any document created using the fonts or their derivatives.
++
++DEFINITIONS
++"Font Software" refers to the set of files released by the Copyright
++Holder(s) under this license and clearly marked as such. This may
++include source files, build scripts and documentation.
++
++"Reserved Font Name" refers to any names specified as such after the
++copyright statement(s).
++
++"Original Version" refers to the collection of Font Software
++components as distributed by the Copyright Holder(s).
++
++"Modified Version" refers to any derivative made by adding to,
++deleting, or substituting -- in part or in whole -- any of the
++components of the Original Version, by changing formats or by porting
++the Font Software to a new environment.
++
++"Author" refers to any designer, engineer, programmer, technical
++writer or other person who contributed to the Font Software.
++
++PERMISSION & CONDITIONS
++Permission is hereby granted, free of charge, to any person obtaining
++a copy of the Font Software, to use, study, copy, merge, embed,
++modify, redistribute, and sell modified and unmodified copies of the
++Font Software, subject to the following conditions:
++
++1) Neither the Font Software nor any of its individual components, in
++Original or Modified Versions, may be sold by itself.
++
++2) Original or Modified Versions of the Font Software may be bundled,
++redistributed and/or sold with any software, provided that each copy
++contains the above copyright notice and this license. These can be
++included either as stand-alone text files, human-readable headers or
++in the appropriate machine-readable metadata fields within text or
++binary files as long as those fields can be easily viewed by the user.
++
++3) No Modified Version of the Font Software may use the Reserved Font
++Name(s) unless explicit written permission is granted by the
++corresponding Copyright Holder. This restriction only applies to the
++primary font name as presented to the users.
++
++4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font
++Software shall not be used to promote, endorse or advertise any
++Modified Version, except to acknowledge the contribution(s) of the
++Copyright Holder(s) and the Author(s) or with their explicit written
++permission.
++
++5) The Font Software, modified or unmodified, in part or in whole,
++must be distributed entirely under this license, and must not be
++distributed under any other license. The requirement for fonts to
++remain under this license does not apply to any document created using
++the Font Software.
++
++TERMINATION
++This license becomes null and void if any of the above conditions are
++not met.
++
++DISCLAIMER
++THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF
++MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT
++OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE
++COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL
++DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
++OTHER DEALINGS IN THE FONT SOFTWARE.
+diff --git a/assets/fonts/SOURCE.txt b/assets/fonts/SOURCE.txt
+new file mode 100644
+index 0000000..54ad625
+--- /dev/null
++++ b/assets/fonts/SOURCE.txt
+@@ -0,0 +1,15 @@
++Noto CJK Simplified Chinese fallback font source
++
++Project: notofonts/noto-cjk
++Release tag: Sans2.004
++Immutable source commit: 523d033d6cb47f4a80c58a35753646f5c3608a78
++Font repository path: Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf
++Font URL: https://github.com/notofonts/noto-cjk/blob/523d033d6cb47f4a80c58a35753646f5c3608a78/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf
++Font raw URL: https://raw.githubusercontent.com/notofonts/noto-cjk/523d033d6cb47f4a80c58a35753646f5c3608a78/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf
++Font SHA-256: 2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b
++
++License: SIL Open Font License 1.1
++License source path: LICENSE at the same repository commit
++License URL: https://github.com/notofonts/noto-cjk/blob/523d033d6cb47f4a80c58a35753646f5c3608a78/LICENSE
++Local license copy: OFL.txt
++License SHA-256: 6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2
+\ No newline at end of file
