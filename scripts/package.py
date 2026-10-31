@@ -158,9 +158,10 @@ def main() -> None:
         (sdl_ttf.resolve(), f"{APP_ROOT}/lib/libSDL3_ttf.so.0"),
     ]
     data_files.extend(gather_assets(assets))
-    for notice in sorted((ROOT / "LICENSES").glob("*")):
+    for notice in sorted((ROOT / "LICENSES").rglob("*")):
         if notice.is_file():
-            data_files.append((notice, f"{APP_ROOT}/licenses/{notice.name}"))
+            relative = notice.relative_to(ROOT / "LICENSES").as_posix()
+            data_files.append((notice, f"{APP_ROOT}/licenses/{relative}"))
     for name in ("LICENSE", "THIRD_PARTY_NOTICES.md", "SOURCE_CODE.md", "MODIFICATIONS.md"):
         data_files.append((ROOT / name, f"{APP_ROOT}/licenses/{name}"))
     data_files.append((ROOT / "source" / "LICENSE.TXT", f"{APP_ROOT}/licenses/PPSSPP.txt"))
