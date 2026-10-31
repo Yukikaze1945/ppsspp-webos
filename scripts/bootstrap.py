@@ -209,6 +209,14 @@ def prepare_fonts(root: Path) -> None:
     font_url = source["Font raw URL"]
     font_name = font_url.rsplit("/", 1)[-1]
     download_verified(font_url, font_dir / font_name, source["Font SHA-256"])
+    # Git on Windows may check text licenses out as CRLF. Canonicalize only
+    # when the LF form exactly matches the pinned upstream SHA-256.
+    license_file = font_dir / source["Local license copy"]
+    if license_file.is_file():
+        current = license_file.read_bytes()
+        canonical = current.replace(b"\r\n", b"\n")
+        if current != canonical and hashlib.sha256(canonical).hexdigest() == source["License SHA-256"]:
+            license_file.write_bytes(canonical)
     download_verified(
         source["License URL"],
         font_dir / source["Local license copy"],

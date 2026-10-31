@@ -1393,7 +1393,7 @@ index 7f3a667..0344338 100644
  	if (!resizedThisFrame) {
 diff --git a/assets/fonts/OFL.txt b/assets/fonts/OFL.txt
 new file mode 100644
-index 0000000..e26f2ab
+index 0000000..d952d62
 --- /dev/null
 +++ b/assets/fonts/OFL.txt
 @@ -0,0 +1,92 @@
@@ -1491,7 +1491,7 @@ index 0000000..e26f2ab
 +OTHER DEALINGS IN THE FONT SOFTWARE.
 diff --git a/assets/fonts/SOURCE.txt b/assets/fonts/SOURCE.txt
 new file mode 100644
-index 0000000..54ad625
+index 0000000..35a5f6a
 --- /dev/null
 +++ b/assets/fonts/SOURCE.txt
 @@ -0,0 +1,15 @@
